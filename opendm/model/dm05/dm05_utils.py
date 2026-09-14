@@ -1,6 +1,7 @@
 """DM05 utility functions for cache handling, time embeddings, and masks."""
 
 import math
+from contextlib import contextmanager, nullcontext
 from functools import partial
 from typing import Any
 
@@ -23,13 +24,29 @@ except ImportError:
 
 from transformers.models.gemma3.modeling_gemma3 import Gemma3DecoderLayer
 
-from opendm.constants.precision import COMPUTE_DTYPE, TF32_ENABLED
+from opendm.constants.precision import (
+    COMPUTE_DTYPE,
+    FP32_MIXED_PRECISION_POLICY,
+    TF32_ENABLED,
+)
 
 
 def dm05_autocast(device: torch.device | str):
     """Run eligible DM05 operators in BF16 on the given device."""
     device_type = device.type if isinstance(device, torch.device) else device
     return torch.autocast(device_type=device_type, dtype=COMPUTE_DTYPE)
+
+
+@contextmanager
+def dm05_inference_context(device: torch.device | str, precision_policy: str):
+    """Combine inference mode with the selected DM05 compute precision."""
+    precision_context = (
+        dm05_autocast(device)
+        if precision_policy == FP32_MIXED_PRECISION_POLICY
+        else nullcontext()
+    )
+    with torch.inference_mode(), precision_context:
+        yield
 
 
 def configure_fp32_precision_runtime() -> None:

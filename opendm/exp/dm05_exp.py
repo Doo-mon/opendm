@@ -6,7 +6,6 @@ import os
 import pathlib
 import sys
 import time
-from contextlib import nullcontext
 from dataclasses import dataclass, field
 from enum import Enum
 from io import BytesIO
@@ -58,7 +57,7 @@ from opendm.model.dm05.dm05_lora import (
 )
 from opendm.model.dm05.dm05_utils import (
     configure_fp32_precision_runtime,
-    dm05_autocast,
+    dm05_inference_context,
 )
 from opendm.optimizer import MuonAdamW, mark_muon_parameters
 from opendm.optimizer.muon_adamw import is_default_muon_parameter
@@ -894,12 +893,7 @@ class DM05InferenceConfig(Config):
                 **inference_kwargs,
             )
         else:
-            precision_context = (
-                dm05_autocast(self.device)
-                if dm05_model.precision_policy == FP32_MIXED_PRECISION_POLICY
-                else nullcontext()
-            )
-            with precision_context:
+            with dm05_inference_context(self.device, dm05_model.precision_policy):
                 actions = self.model.inference_action(**inference_kwargs)
         if torch.cuda.is_available():
             torch.cuda.synchronize()
