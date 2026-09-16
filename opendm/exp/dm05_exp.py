@@ -322,6 +322,10 @@ class DM05DataConfig(Config):
         )
 
     def norm_stats_path(self, action_horizon: int) -> pathlib.Path:
+        explicit_path = pathlib.Path(self.norm_stats_root) / "norm_stats.json"
+        if explicit_path.is_file():
+            return explicit_path
+
         action_transform = self._action_transform(action_horizon)
         digest = hashlib.sha256(
             f"{self.dataset_name}|{action_transform}".encode()

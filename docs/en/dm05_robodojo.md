@@ -41,6 +41,8 @@ cat data/.hf_downloads/robodojo_sim/robodojo_sim.tar.gz.part-* \
   | tar -xzf - -C data
 
 hf download Dexmal/DM05-MEM --local-dir checkpoints/DM05-MEM
+hf download Dexmal/DM05-MEM-Robodojo-Sim norm_stats.json \
+  --local-dir ./norm_stats/robodojo_hf
 ```
 
 Confirm that the data directory has the following structure:
@@ -72,6 +74,7 @@ opendm/dataset/robodojo.py
 Notes:
 
 - `opendm/dataset/robodojo.py` registers RoboDojo-Sim datasets.
+- For better reproduction results, use [DM05-MEM-Robodojo-Sim's norm_stats.json](https://huggingface.co/Dexmal/DM05-MEM-Robodojo-Sim/blob/main/norm_stats.json) from Hugging Face as the normalization statistics during training.
 - When training starts, if the corresponding normalization statistics file does not exist, the script automatically computes it based on the current dataset, action mode, and action chunk length, then saves it under `./norm_stats/`.
 - When saving a checkpoint, the normalization statistics used for training are copied to `norm_stats.json` under the checkpoint directory. Inference first reads that file.
 - `--data-config.dataset-name` in the training command must match a registered name. The official example name is `robodojo_sim_cover_blocks`.
@@ -90,6 +93,7 @@ script/dm05_launcher.sh \
   --task train \
   --nproc_per_node 8 \
   --data-config.dataset-name robodojo_sim_cover_blocks \
+  --data-config.norm-stats-root ./norm_stats/robodojo_hf \
   --model-config.model-name-or-path ./checkpoints/DM05-MEM \
   --trainer-config.num-train-steps 30000
 ```

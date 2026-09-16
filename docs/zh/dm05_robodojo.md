@@ -41,6 +41,8 @@ cat data/.hf_downloads/robodojo_sim/robodojo_sim.tar.gz.part-* \
   | tar -xzf - -C data
 
 hf download Dexmal/DM05-MEM --local-dir checkpoints/DM05-MEM
+hf download Dexmal/DM05-MEM-Robodojo-Sim norm_stats.json \
+  --local-dir ./norm_stats/robodojo_hf
 ```
 
 确认数据目录结构如下：
@@ -72,6 +74,7 @@ opendm/dataset/robodojo.py
 说明：
 
 - `opendm/dataset/robodojo.py` 用于注册 RoboDojo-Sim 数据集。
+- 为获得更好的复现效果，训练时请使用 Hugging Face 上 [DM05-MEM-Robodojo-Sim 的 norm_stats.json](https://huggingface.co/Dexmal/DM05-MEM-Robodojo-Sim/blob/main/norm_stats.json) 作为归一化统计。
 - 训练启动时，如果对应的归一化参数文件不存在，脚本会根据当前数据集、action mode 和 action chunk 长度自动计算并保存到 `./norm_stats/`。
 - checkpoint 保存时会同时把训练使用的归一化参数复制为 checkpoint 目录下的 `norm_stats.json`。推理会优先读取 checkpoint 目录下的 `norm_stats.json`。
 - 训练命令中的 `--data-config.dataset-name` 需要与注册名称一致。官方示例名称为 `robodojo_sim_cover_blocks`。
@@ -90,6 +93,7 @@ script/dm05_launcher.sh \
   --task train \
   --nproc_per_node 8 \
   --data-config.dataset-name robodojo_sim_cover_blocks \
+  --data-config.norm-stats-root ./norm_stats/robodojo_hf \
   --model-config.model-name-or-path ./checkpoints/DM05-MEM \
   --trainer-config.num-train-steps 30000
 ```
