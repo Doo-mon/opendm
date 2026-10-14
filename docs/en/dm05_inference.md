@@ -63,6 +63,8 @@ Before the first fast launch, confirm:
 | Base pretrained model | `opendm/exp/dm05_exp.py` | `Dexmal/DM05` | 50 | 3 | 14 |
 | LIBERO | `playground/dm05_libero.py` | `Dexmal/DM05-libero` | 10 | 2 | 7 |
 | RoboTwin 2.0 | `playground/dm05_robotwin2.py` | `Dexmal/DM05-robotwin2` | 50 | 3 | 14 |
+| RoboColiseum G2 | `playground/dm05_robocoliseum.py` | Matching RoboColiseum checkpoint for 'Instruction Following', 'spatial reasoning' and 'Robustbess' suite | 50 | 3 | 16 / 16 (22-D internal) |
+| RoboColiseum manipulation | `playground/dm05_robocoliseum_manipulation.py` | Matching RoboColiseum checkpoint for 'General Manipulation' suite'  | 30 | 3 | 21 / 21 (22-D internal) |
 | DM05-MEM | `playground/dm05_mem_sft_demo.py` | `Dexmal/DM05-MEM` | 50 | 3 | 14 |
 | Demo or custom SFT | `playground/dm05_sft_demo.py` or your own entry | Your SFT checkpoint | Training value | Training value | Training value |
 | LIBERO LoRA | `playground/dm05_libero_lora.py` | A LIBERO LoRA step checkpoint | 10 | 2 | 7 |
@@ -167,6 +169,57 @@ script/dm05_launcher.sh \
 
 The RoboTwin 2.0 entry point uses three images, a 14-dimensional state/action,
 and the `Aloha RoboTwin2` robot type.
+
+### RoboColiseum G2
+
+Use a checkpoint trained for the selected RoboColiseum layout. The base G2
+service is started with:
+
+```bash
+script/dm05_launcher.sh \
+  --exp playground/dm05_robocoliseum.py \
+  --task inference \
+  --model-config.model-name-or-path /path/to/robocoliseum-g2-checkpoint \
+  --inference-config.port 7891
+```
+
+The API accepts a 16-dimensional state in native RoboColiseum order:
+
+```text
+[left joints (7), left gripper, right joints (7), right gripper]
+```
+
+It returns 50 actions in the same 16-dimensional order. The entry point maps
+the request and response to the checkpoint's shared 22-dimensional layout
+internally, so keep `--inference-config.output-action-dim` at its entry-point
+default of `22`. It requires three current images in `Head`, `Left wrist`,
+`Right wrist` order and does not accept history images.
+
+For the 30-step whole-body manipulation checkpoint, use:
+
+```bash
+script/dm05_launcher.sh \
+  --exp playground/dm05_robocoliseum_manipulation.py \
+  --task inference \
+  --model-config.model-name-or-path /path/to/robocoliseum-manipulation-checkpoint \
+  --inference-config.port 7891
+```
+
+This variant accepts and returns the native 21-dimensional layout:
+
+```text
+[left joints (7), left gripper, right joints (7), right gripper, torso (5)]
+```
+
+The response contains 30 actions. Only the final torso dimension is predicted;
+the first four torso values are copied from the request state into every action.
+The entry point performs the shared-layout and gripper-sign conversions
+internally. It also uses three current images, no history images, and an
+internal `output_action_dim` of `22`.
+
+Both entries read normalization statistics from `norm_stats.json` in the
+checkpoint directory by default. If the file is stored elsewhere, pass
+`--norm-stats /path/to/norm_stats.json`.
 
 ### DM05-MEM
 
@@ -305,6 +358,8 @@ slots (`--num-images 35`); RoboDojo `cover_blocks` uses 20 (`--num-images 23`).
   small for the configured image count are skipped automatically. MEM demo and
   `cover_blocks` use a single bucket `2048`. The default backend does not use
   prefix buckets.
+- RoboColiseum manipulation uses a `4096`-token limit on both backends. Its fast
+  backend buckets default to `896 1024 2048 4096`.
 - A custom bucket list must be non-empty, strictly increasing, and no larger
   than `fast_prefix_len`.
 - More buckets increase service startup time and GPU memory use.
@@ -463,10 +518,10 @@ A successful legacy response returns the historical shape:
 | `--model-config.chunk-size` | Action horizon; must match training and the client. |
 | `--trainer-config.model-max-length` | Maximum tokenized multimodal prefix length. |
 | `--inference-config.diffusion-steps` | Number of action diffusion steps; default `10`. |
-| `--inference-config.output-action-dim` | Returned action dimension; must match normalization statistics. |
+| `--inference-config.output-action-dim` | Internal normalized action dimension. It normally equals the API action dimension; both RoboColiseum entries keep it at `22` and remap the response to 16-D or 21-D. |
 | `--inference-config.image-prompts` | Ordered camera labels, one-to-one with `observation.images` keys `"1"`, `"2"`, …. |
 | `--inference-config.max-history-images` | History request cap for both backends. Parent default `5`; MEM demo `32`; RoboDojo `cover_blocks` `20`. |
-| `--inference-config.fast-prefix-len` | Fast backend prefix token capacity. Parent default `1024`; MEM demo and `cover_blocks` use `2048`. |
+| `--inference-config.fast-prefix-len` | Fast backend prefix token capacity. Parent default `1024`; MEM demo and `cover_blocks` use `2048`; RoboColiseum manipulation uses `4096`. |
 | `--data-config.is-history` | Required to accept `history_images`; plain `curl_demo.sh` does not need it. |
 | `--inference-config.backend` | `default` or `fast`. |
 | `--inference-config.vision-trt-engine-path` | Checkpoint-specific TensorRT vision engine path; default `checkpoints/trt_engines/dm05_vision.engine`. |

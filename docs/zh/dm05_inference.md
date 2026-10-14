@@ -14,7 +14,8 @@
   `pip install -e ".[fast-infer]"` 安装额外依赖层。
 - 与所选 playground 入口匹配的 DM05 checkpoint。
 - checkpoint 目录下与训练配置匹配的 `norm_stats.json`。如果不存在，OpenDM 会回退到
-  `./norm_stats/` 下的匹配文件。
+  `./norm_stats/` 下的匹配文件。RoboColiseum 入口除外：它们默认要求文件位于 checkpoint
+  目录中，除非显式传入 `--norm-stats`。
 - 一张 NVIDIA GPU。
 
 一个 `norm_stats.json` 可以在 `norm_stats_by_robot` 中保存多个机型 profile。
@@ -51,14 +52,16 @@ Checkpoint、playground 入口、`chunk_size`、image keys、state/action 维度
 
 ## 2. 选择推理入口
 
-| 使用场景 | 入口 | 常用 checkpoint | Chunk size | 图片数 | Action 维度 |
-| --- | --- | --- | ---: | ---: | ---: |
-| 基础预训练模型 | `opendm/exp/dm05_exp.py` | `Dexmal/DM05` | 50 | 3 | 14 |
-| LIBERO | `playground/dm05_libero.py` | `Dexmal/DM05-libero` | 10 | 2 | 7 |
-| RoboTwin 2.0 | `playground/dm05_robotwin2.py` | `Dexmal/DM05-robotwin2` | 50 | 3 | 14 |
-| DM05-MEM | `playground/dm05_mem_sft_demo.py` | `Dexmal/DM05-MEM` | 50 | 3 | 14 |
+| 使用场景 | 入口 | 常用 checkpoint | Chunk size | 图片数 | API state/action 维度 |
+| --- | --- | --- | ---: | ---: | --- |
+| 基础预训练模型 | `opendm/exp/dm05_exp.py` | `Dexmal/DM05` | 50 | 3 | 14 / 14 |
+| LIBERO | `playground/dm05_libero.py` | `Dexmal/DM05-libero` | 10 | 2 | 8 / 7 |
+| RoboTwin 2.0 | `playground/dm05_robotwin2.py` | `Dexmal/DM05-robotwin2` | 50 | 3 | 14 / 14 |
+| RoboColiseum G2 | `playground/dm05_robocoliseum.py` | 匹配 `Instruction Following`、`Spatial Reasoning` 和 `Robustness` 套件的 RoboColiseum checkpoint | 50 | 3 | 16 / 16（内部 22 维） |
+| RoboColiseum manipulation | `playground/dm05_robocoliseum_manipulation.py` | 匹配 `General Manipulation` 套件的 RoboColiseum checkpoint | 30 | 3 | 21 / 21（内部 22 维） |
+| DM05-MEM | `playground/dm05_mem_sft_demo.py` | `Dexmal/DM05-MEM` | 50 | 3 | 14 / 14 |
 | Demo 或自定义 SFT | `playground/dm05_sft_demo.py` 或自定义入口 | SFT checkpoint | 训练值 | 训练值 | 训练值 |
-| LIBERO LoRA | `playground/dm05_libero_lora.py` | LIBERO LoRA step checkpoint | 10 | 2 | 7 |
+| LIBERO LoRA | `playground/dm05_libero_lora.py` | LIBERO LoRA step checkpoint | 10 | 2 | 8 / 7 |
 
 不要混用不同 benchmark 的 checkpoint、入口或推理维度。
 
@@ -152,6 +155,51 @@ script/dm05_launcher.sh \
 ```
 
 RoboTwin 2.0 入口使用三张图片、14 维 state/action 和 `Aloha RoboTwin2` robot type。
+
+### RoboColiseum G2
+
+请使用与所选 RoboColiseum 布局匹配的 checkpoint。基础 G2 服务启动命令为：
+
+```bash
+script/dm05_launcher.sh \
+  --exp playground/dm05_robocoliseum.py \
+  --task inference \
+  --model-config.model-name-or-path /path/to/robocoliseum-g2-checkpoint \
+  --inference-config.port 7891
+```
+
+API 接受 RoboColiseum 原生顺序的 16 维 state：
+
+```text
+[左臂关节 (7), 左夹爪, 右臂关节 (7), 右夹爪]
+```
+
+服务返回相同 16 维顺序的 50 个 action。入口会在内部完成原生布局与 checkpoint 共享
+22 维布局之间的映射，因此 `--inference-config.output-action-dim` 应保留入口默认值 `22`。
+该入口要求按 `Head`、`Left wrist`、`Right wrist` 顺序提供三张当前图像，不接受历史图像。
+
+30 步全身 manipulation checkpoint 使用以下入口：
+
+```bash
+script/dm05_launcher.sh \
+  --exp playground/dm05_robocoliseum_manipulation.py \
+  --task inference \
+  --model-config.model-name-or-path /path/to/robocoliseum-manipulation-checkpoint \
+  --inference-config.port 7891
+```
+
+该变体接受并返回原生 21 维布局：
+
+```text
+[左臂关节 (7), 左夹爪, 右臂关节 (7), 右夹爪, 躯干 (5)]
+```
+
+响应包含 30 个 action。模型只预测最后一个躯干维度；前四个躯干值会从请求 state 复制
+到每个 action。入口在内部完成共享布局和夹爪符号转换。该变体同样使用三张当前图像、
+不接受历史图像，并保持内部 `output_action_dim=22`。
+
+两个入口默认都从 checkpoint 目录下的 `norm_stats.json` 读取归一化统计。如果文件位于
+其他位置，请传入 `--norm-stats /path/to/norm_stats.json`。
 
 ### DM05-MEM
 
@@ -278,6 +326,8 @@ python -m opendm.infer.build_vision_trt \
 - 父类默认 prefix buckets 为 `576 704 768 896 1024`；无法容纳当前图片数量的过小默认值
   会被自动跳过。MEM demo 和 `cover_blocks` 使用单个 bucket `2048`。Default backend
   不使用 prefix buckets。
+- RoboColiseum manipulation 在两个 backend 上都使用 `4096` token 上限；其 fast backend
+  默认 buckets 为 `896 1024 2048 4096`。
 - 自定义 bucket 列表必须非空、严格递增，并且不能超过 `fast_prefix_len`。
 - Bucket 越多，服务启动时间和显存占用越高。
 - 请求超过最大自定义 bucket、但仍不超过 `fast_prefix_len` 时，会使用更慢的 eager fallback。
@@ -417,10 +467,10 @@ Legacy 成功响应保持历史格式：
 | `--model-config.chunk-size` | Action horizon，必须与训练和客户端一致。 |
 | `--trainer-config.model-max-length` | Tokenized multimodal prefix 最大长度。 |
 | `--inference-config.diffusion-steps` | Action diffusion steps，默认值为 `10`。 |
-| `--inference-config.output-action-dim` | 返回的 action 维度，必须与归一化统计一致。 |
+| `--inference-config.output-action-dim` | 内部归一化 action 维度，通常与 API action 维度相同；两个 RoboColiseum 入口均保持 `22`，再将响应映射为 16 维或 21 维。 |
 | `--inference-config.image-prompts` | 有序相机标签，与 `observation.images` 的 `"1"`、`"2"`、… 一一对应。 |
 | `--inference-config.max-history-images` | 两个 backend 的历史帧请求上限。父类默认 `5`；MEM demo `32`；RoboDojo `cover_blocks` `20`。 |
-| `--inference-config.fast-prefix-len` | Fast backend 的 prefix token 容量。父类默认 `1024`；MEM demo 和 `cover_blocks` 为 `2048`。 |
+| `--inference-config.fast-prefix-len` | Fast backend 的 prefix token 容量。父类默认 `1024`；MEM demo 和 `cover_blocks` 为 `2048`；RoboColiseum manipulation 为 `4096`。 |
 | `--data-config.is-history` | 开启后才接受 `history_images`；普通 `curl_demo.sh` 不需要。 |
 | `--inference-config.backend` | `default` 或 `fast`。 |
 | `--inference-config.vision-trt-engine-path` | 当前 checkpoint 专用的 TensorRT vision engine 路径；默认值为 `checkpoints/trt_engines/dm05_vision.engine`。 |
