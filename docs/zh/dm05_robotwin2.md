@@ -1,6 +1,6 @@
 # DM05 RoboTwin 2.0 训练与评测指南
 
-本文档介绍如何使用 `DM05` 完成 RoboTwin 2.0 场景下的模型训练、推理服务启动以及 benchmark 评测。
+使用 `DM05` 在 RoboTwin 2.0 上训练、部署推理服务并评测。
 
 ## 参考指标
 
@@ -12,11 +12,10 @@
 
 ### 前提条件
 
-开始训练前，请确认已经完成以下准备：
-
-- 已按照官方步骤完成 OpenDM 环境安装和源码初始化。
-- 训练、推理和评测需要使用 NVIDIA GPU，推荐使用 A100、H100、H20、RTX 4090 等 GPU。在 RTX 4090 等显存较小的 GPU 上执行 Full SFT 时，FSDP 初始化阶段的显存峰值可能导致训练失败，建议采用 LoRA 微调。
-- 如果环境中没有 `hf` 命令，请先安装 Hugging Face CLI：
+- 按官方步骤安装并初始化 OpenDM。
+- 使用 NVIDIA GPU，如 A100、H100、H20 或 RTX 4090。在 RTX 4090 等显存较小的
+  GPU 上，Full SFT 可能在 FSDP 初始化时显存不足，此时建议使用 LoRA 微调。
+- 若没有 `hf` 命令，先安装 Hugging Face CLI：
 
 ```bash
 pip install -U huggingface_hub
@@ -24,7 +23,7 @@ pip install -U huggingface_hub
 
 ### 数据准备
 
-RoboTwin 2.0 完整数据集和 DM05 基础模型可从 Hugging Face 下载：
+从 Hugging Face 下载数据集和基础模型：
 
 - RoboTwin 2.0 完整数据集：[Dexmal/robotwin2-full](https://huggingface.co/datasets/Dexmal/robotwin2-full)
 - DM05 模型：[Dexmal/DM05](https://huggingface.co/Dexmal/DM05)
@@ -40,8 +39,7 @@ hf download Dexmal/robotwin2-full \
   --repo-type dataset \
   --local-dir data/.hf_downloads/robotwin
 
-# 合并分卷，并将压缩包顶层的 robotwin2.0 目录解压到 ./data，
-# 与 OpenDM 注册文件中的路径保持一致。
+# 合并分卷并解压到 ./data/robotwin2.0。
 cat data/.hf_downloads/robotwin/robotwin2.tar.part-* \
   | tar -xf - -C data
 
@@ -49,39 +47,44 @@ cat data/.hf_downloads/robotwin/robotwin2.tar.part-* \
 hf download Dexmal/DM05 --local-dir checkpoints/DM05
 ```
 
-确认解压后的数据目录结构如下：
+解压后的目录结构（`<setting>` 为 `clean` 或 `randomized`）：
 
 ```text
 data/robotwin2.0/
-├── jsonl/
-│   ├── adjust_bottle/
-│   │   ├── clean/
-│   │   └── randomized/
-│   └── ...
-└── video/
-    ├── adjust_bottle/
-    │   ├── clean/
-    │   └── randomized/
-    └── ...
+├── jsonl/<task>/<setting>/
+└── video/<task>/<setting>/
 ```
 
-OpenDM 在 `opendm/dataset/robotwin2.py` 中注册了名为
-`robotwin2_generalist` 的数据集，注册配置包括：
+`opendm/dataset/robotwin2.py` 将该数据包注册为 `robotwin2_generalist`，根目录为
+`./data/robotwin2.0`。默认配方使用 100 个名为
+`robotwin2_component_<task>_<setting>` 的加权视图，覆盖全部 50 个任务的两种设置。
+各视图读取 `jsonl/<task>/<setting>/`，共用 `video/` 根目录。原有的
+`robotwin2_example_<task>_<setting>` 配置仍作为兼容别名受到支持。
 
-- 数据根目录为 `./data/robotwin2.0`；
-- `images_1`、`images_2`、`images_3` 分别对应头部、左腕和右腕 RGB 图像；
-- 使用 ALOHA RoboTwin2 embodiment，state 和 action 均为 14 维；
-- 使用绝对关节位置动作。
+ALOHA RoboTwin2 配方使用：
 
-训练启动时，如果 `./norm_stats/` 下不存在匹配的归一化参数，OpenDM
-会自动计算并保存。保存 checkpoint 时，训练使用的归一化参数也会复制到
-checkpoint 目录下的 `norm_stats.json`。推理会优先读取该文件，因此请将它与模型权重一起保留。
+- 头部、左腕、右腕 RGB 图像，依次对应 `images_1`、`images_2`、`images_3`。
+- 未来帧 `state` 构造的绝对关节位置目标，忽略原始 `action`。
+- 原生 14 维 state/action 校验和归一化，不做分位数裁剪；仅将归一化后的 action
+  和 mask 补齐至 32 维。
+- task/subtask prompt 采样，以及先选数据集、再选样本的加权采样。
+
+归一化参数缺失时，训练启动后会自动计算并保存到
+`<norm-stats-root>/norm_stats.json`（默认为
+`./norm_stats/robotwin2_absolute_action/14d/norm_stats.json`）。可用
+`--data-config.norm-stats-root` 覆盖目录，也可在训练前计算：
+
+```bash
+python playground/dm05_robotwin2.py --task compute_norm_stats
+```
+
+使用与训练相同的数据集选择和路径。归一化参数会复制到各 checkpoint 的
+`norm_stats.json`，推理优先读取该文件，请与权重一起保留。
 
 ### 启动训练
 
 RoboTwin 2.0 参考训练配置必须使用 4 机训练，每机 8 张 GPU。在每台机器的
-OpenDM 仓库根目录运行相同命令，并将 `<NODE_RANK>` 分别设为 `0`、`1`、`2`、
-`3`：
+OpenDM 仓库根目录运行以下命令，将 `<NODE_RANK>` 分别设为 `0`、`1`、`2`、`3`：
 
 ```bash
 script/dm05_launcher.sh \
@@ -92,7 +95,6 @@ script/dm05_launcher.sh \
   --node_rank <NODE_RANK> \
   --master_addr <MASTER_ADDR> \
   --master_port 29500 \
-  --data-config.dataset-name robotwin2_generalist \
   --model-config.model-name-or-path ./checkpoints/DM05 \
   --model-config.chunk-size 50 \
   --trainer-config.per-device-train-batch-size 32 \
@@ -100,10 +102,9 @@ script/dm05_launcher.sh \
   --trainer-config.num-train-steps 100000
 ```
 
-其中 `<MASTER_ADDR>` 为 node rank 0 机器的可访问地址。
+将 `<MASTER_ADDR>` 设为 rank 0 机器的地址，并确保所有节点均可访问其 `29500` 端口。
 
-该参考训练配置要求 global batch size 必须为 `1024`，并且
-`gradient_accumulation_steps` 必须为 `1`。计算公式为：
+global batch size 必须为 `1024`，且 `gradient_accumulation_steps=1`：
 
 ```text
 global batch size = 机器数 × 单机 GPU 数 × per-device train batch size × gradient accumulation steps
@@ -111,33 +112,17 @@ global batch size = 机器数 × 单机 GPU 数 × per-device train batch size �
                   = 1024
 ```
 
-因此该配置不能改成单机训练；如果修改 GPU 数量或单卡 batch size，需要保证
-`机器数 × 单机 GPU 数 × per-device train batch size = 1024`，且
-`gradient_accumulation_steps` 仍为 `1`。
+该配置不能改成单机训练。调整 GPU 数量或单卡 batch size 时，仍须使用 4 台机器，
+保持 global batch size 为 `1024`、`gradient_accumulation_steps=1`。
 
-参数说明：
+如需将整个数据包作为单一数据集采样，关闭默认加权视图，可同时传入
+`--data-config.dataset-name robotwin2_generalist` 和
+`--data-config.dataset-weights 1.0`。
 
-- `--exp playground/dm05_robotwin2.py`：RoboTwin 2.0 训练和推理入口，预设了该
-  embodiment 使用的数据集、action mode、优化器和训练参数。
-- `--task train`：启动训练。
-- `--nproc_per_node 8`：每台机器使用 8 张 GPU。
-- `--nnodes 4`：必须使用 4 台机器参与训练。
-- `--node_rank <NODE_RANK>`：当前机器编号，4 台机器分别设为 `0`、`1`、`2`、`3`。
-- `--master_addr <MASTER_ADDR>`：node rank 0 机器的可访问地址。
-- `--master_port 29500`：多机训练 rendezvous 端口，需要保证各节点可访问。
-- `--data-config.dataset-name robotwin2_generalist`：
-  `opendm/dataset/robotwin2.py` 中注册的数据集名称。
-- `--model-config.model-name-or-path ./checkpoints/DM05`：DM05 基础模型路径。
-- `--model-config.chunk-size 50`：action chunk 长度，训练、推理和评测必须保持一致。
-- `--trainer-config.per-device-train-batch-size 32`：每张 GPU 每次前向计算处理 32 个样本。
-- `--trainer-config.gradient-accumulation-steps 1`：每次反向传播后执行一次参数更新；
-  4 机 8 卡训练时配合单卡 batch size 32 将 global batch size 固定为 1024。
-- `--trainer-config.num-train-steps 100000`：总训练步数。
-
-默认训练输出目录为 `user_checkpoints/dm05_robotwin2`。如需调整单卡 batch size、
-保存间隔、输出目录或总训练步数，可通过对应的命令行参数覆盖默认配置；调整
-单卡 batch size 或 GPU 数量时，仍须保持 `gradient_accumulation_steps=1`，并确保
-global batch size 为 `1024`。
+默认配置：输出目录 `user_checkpoints/dm05_robotwin2`、绝对动作、chunk size 50、
+最大 token 长度 1152、FSDP1、BF16 和 Muon AdamW。可通过对应命令行选项覆盖训练参数，
+但须满足上述 batch size 约束。训练、推理和评测的 chunk size 必须一致，
+推理使用 checkpoint 中的归一化参数。
 
 ## RoboTwin 2.0 推理
 
@@ -147,8 +132,7 @@ global batch size 为 `1024`。
 
 ### 准备 dexbotic-benchmark
 
-条件允许时，建议使用一张 GPU 运行推理服务，另一张 GPU 运行 RoboTwin 2.0
-仿真环境。推荐使用官方 Docker 镜像作为 benchmark 客户端：
+条件允许时，推理和仿真使用不同 GPU。准备官方 benchmark Docker 镜像：
 
 ```bash
 git clone https://github.com/dexmal/dexbotic-benchmark.git
@@ -157,9 +141,8 @@ git submodule update --init --recursive RoboTwin
 docker pull dexmal/dexbotic_benchmark
 ```
 
-RoboTwin 2.0 还需要 assets、object-data texture library 和 embodiment 文件。
-请按照 [RoboTwin 安装文档](https://robotwin-platform.github.io/doc/usage/robotwin-install.html#4-download-assets-robotwin-od-texture-library-and-embodiments)
-完成下载后再启动评测。
+评测前，按照 [RoboTwin 安装文档](https://robotwin-platform.github.io/doc/usage/robotwin-install.html#4-download-assets-robotwin-od-texture-library-and-embodiments)
+下载 assets、object-data texture library 和 embodiment 文件。
 
 ### 配置评测任务
 
@@ -185,20 +168,16 @@ action_mode: absolute
 
 重要配置项：
 
-- `task_name`：RoboTwin 2.0 的 50 个任务之一，每个任务需要独立评测。
-- `task_config`：Clean 设置使用 `demo_clean`，Randomized 设置使用
-  `demo_randomized`。
-- `base_url`：已启动的 DM05 推理服务地址；远程服务通常填写
-  `http://<SERVER_IP>:7891`。
-- `cameras`：必须保持头部、左腕、右腕的顺序，以对应 `images_1`、
-  `images_2`、`images_3`。
-- `action_horizon`：每次请求返回并执行的动作数，需要与模型的 chunk size 50 保持一致。
-- `action_mode`：绝对关节位置使用 `absolute`，相对关节位置使用 `relative`；当前
-  checkpoint 使用 `absolute`。
-- `output_dir`：评测结果和 rollout 视频的保存根目录。
+- `task_name`：50 个任务之一，独立评测。
+- `task_config`：`demo_clean` 或 `demo_randomized`。
+- `base_url`：DM05 服务地址；远程服务填写 `http://<SERVER_IP>:7891`。
+- `cameras`：保持头部、左腕、右腕顺序，对应 `images_1/2/3`。
+- `action_horizon`：每次请求返回并执行的动作数，须与 chunk size 50 一致。
+- `action_mode`：当前 checkpoint 使用 `absolute`（绝对关节位置）。
+- `output_dir`：结果和 rollout 视频目录。
 
-benchmark runner 会对所选任务和设置评测 100 个 episode。要复现汇总的 Clean 和
-Randomized 指标，需要分别在两种设置下评测全部 50 个任务，再汇总各任务成功率。
+每个任务、每种设置评测 100 个 episode。复现 Clean 和 Randomized 汇总指标时，
+在两种设置下评测全部 50 个任务并汇总成功率。
 
 ### 使用 Docker 启动评测
 
@@ -223,8 +202,7 @@ docker run --rm --gpus all --network host \
 
 ### 使用本地环境启动评测
 
-如需调试仿真环境，请参考 `dexbotic-benchmark/docs/local_install.md` 安装
-RoboTwin 环境。激活 `RoboTwin` Conda 环境后运行：
+调试仿真环境时，参考 `dexbotic-benchmark/docs/local_install.md` 安装环境后运行：
 
 ```bash
 cd dexbotic-benchmark
@@ -234,11 +212,7 @@ conda activate RoboTwin
 bash scripts/env_sh/robotwin2.sh \
   evaluation/configs/robotwin2/adjust_bottle.yaml
 
-# 也可以直接使用 Python evaluator。
-python evaluation/run_robotwin2_evaluation.py \
-  --config evaluation/configs/robotwin2/adjust_bottle.yaml
-
-# 还可以在运行时覆盖部分配置。
+# 或直接运行 Python，并按需覆盖配置。
 python evaluation/run_robotwin2_evaluation.py \
   --config evaluation/configs/robotwin2/adjust_bottle.yaml \
   --set base_url http://localhost:7891 \
@@ -255,5 +229,5 @@ python evaluation/run_robotwin2_evaluation.py \
 └── *.mp4
 ```
 
-`_result.txt` 记录所选任务和设置的成功率。如果 RoboTwin 任务配置启用了视频记录，
-同一个时间戳目录下还会包含 rollout 视频。
+`_result.txt` 记录该任务和设置的成功率。RoboTwin 任务配置启用视频记录时，
+rollout 视频保存在同一目录。

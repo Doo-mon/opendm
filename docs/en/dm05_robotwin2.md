@@ -1,7 +1,6 @@
 # DM05 RoboTwin 2.0 Training and Evaluation Guide
 
-This document describes how to use `DM05` for model training, inference service
-startup, and benchmark evaluation in RoboTwin 2.0 scenarios.
+Train, serve, and evaluate `DM05` on RoboTwin 2.0.
 
 ## Reference Results
 
@@ -13,13 +12,11 @@ startup, and benchmark evaluation in RoboTwin 2.0 scenarios.
 
 ### Prerequisites
 
-Before training, make sure the following preparation is complete:
-
-- OpenDM has been installed and initialized according to the official steps.
-- Training, inference, and evaluation require NVIDIA GPUs. Recommended GPUs
-  include A100, H100, H20, and RTX 4090. On lower-memory GPUs such as RTX 4090,
-  Full SFT may fail due to peak memory use during FSDP initialization; LoRA fine-tuning is recommended.
-- Install the Hugging Face CLI if the `hf` command is not available:
+- Install and initialize OpenDM following the official instructions.
+- Use NVIDIA GPUs, such as A100, H100, H20, or RTX 4090. Full SFT may run out
+  of memory during FSDP initialization on lower-memory GPUs such as RTX 4090;
+  use LoRA fine-tuning in that case.
+- Install the Hugging Face CLI if `hf` is unavailable:
 
 ```bash
 pip install -U huggingface_hub
@@ -27,8 +24,7 @@ pip install -U huggingface_hub
 
 ### Data Preparation
 
-The complete RoboTwin 2.0 dataset and the DM05 base model can be downloaded
-from Hugging Face:
+Download the dataset and base model from Hugging Face:
 
 - Complete RoboTwin 2.0 dataset: [Dexmal/robotwin2-full](https://huggingface.co/datasets/Dexmal/robotwin2-full)
 - DM05 model: [Dexmal/DM05](https://huggingface.co/Dexmal/DM05)
@@ -44,8 +40,7 @@ hf download Dexmal/robotwin2-full \
   --repo-type dataset \
   --local-dir data/.hf_downloads/robotwin
 
-# Join the split archive and extract its top-level robotwin2.0 directory
-# under ./data, matching the path registered by OpenDM.
+# Join and extract the archive to ./data/robotwin2.0.
 cat data/.hf_downloads/robotwin/robotwin2.tar.part-* \
   | tar -xf - -C data
 
@@ -53,42 +48,45 @@ cat data/.hf_downloads/robotwin/robotwin2.tar.part-* \
 hf download Dexmal/DM05 --local-dir checkpoints/DM05
 ```
 
-Confirm that the extracted data has the following structure:
+Expected layout (`<setting>` is `clean` or `randomized`):
 
 ```text
 data/robotwin2.0/
-├── jsonl/
-│   ├── adjust_bottle/
-│   │   ├── clean/
-│   │   └── randomized/
-│   └── ...
-└── video/
-    ├── adjust_bottle/
-    │   ├── clean/
-    │   └── randomized/
-    └── ...
+├── jsonl/<task>/<setting>/
+└── video/<task>/<setting>/
 ```
 
-OpenDM registers the dataset in `opendm/dataset/robotwin2.py` with the name
-`robotwin2_generalist`. The registration uses:
+`opendm/dataset/robotwin2.py` registers this archive as `robotwin2_generalist`
+with root `./data/robotwin2.0`. The default recipe uses 100 weighted views named
+`robotwin2_component_<task>_<setting>`, covering all 50 tasks in both settings.
+Each view reads `jsonl/<task>/<setting>/` and shares the `video/` root.
 
-- `./data/robotwin2.0` as the dataset root;
-- `images_1`, `images_2`, and `images_3` for the head, left-wrist, and
-  right-wrist RGB views;
-- the ALOHA RoboTwin2 embodiment with a 14-dimensional state and action;
-- absolute joint-position actions.
+The ALOHA RoboTwin2 recipe uses:
 
-When training starts, OpenDM computes normalization statistics automatically if
-the matching file does not already exist under `./norm_stats/`. When a
-checkpoint is saved, the statistics used for training are copied to
-`norm_stats.json` in the checkpoint directory. Inference reads this checkpoint
-file first, so keep it together with the model weights.
+- Head, left-wrist, and right-wrist RGB views (`images_1`, `images_2`, `images_3`).
+- Absolute joint-position targets from future `state` values, ignoring raw `action`.
+- Native 14D state/action validation and normalization without quantile clipping;
+  only normalized actions and masks are padded to 32D.
+- Task/subtask prompt sampling and weighted sampling of datasets, then samples.
+
+Missing normalization statistics are computed automatically at startup and saved
+to `<norm-stats-root>/norm_stats.json` (by default
+`./norm_stats/robotwin2_absolute_action/14d/norm_stats.json`). Override the
+directory with `--data-config.norm-stats-root`, or compute statistics before training:
+
+```bash
+python playground/dm05_robotwin2.py --task compute_norm_stats
+```
+
+Use the same dataset selection and paths as training. Statistics are copied to
+each checkpoint as `norm_stats.json`; keep this file with the weights, as
+inference reads it first.
 
 ### Start Training
 
 The RoboTwin 2.0 reference training configuration must use 4 nodes, with 8 GPUs
-per node. Run the same command from the OpenDM repository root on each node, and
-set `<NODE_RANK>` to `0`, `1`, `2`, and `3` respectively:
+per node. Run the following from the OpenDM repository root on each node,
+setting `<NODE_RANK>` to `0`, `1`, `2`, and `3` respectively:
 
 ```bash
 script/dm05_launcher.sh \
@@ -99,7 +97,6 @@ script/dm05_launcher.sh \
   --node_rank <NODE_RANK> \
   --master_addr <MASTER_ADDR> \
   --master_port 29500 \
-  --data-config.dataset-name robotwin2_generalist \
   --model-config.model-name-or-path ./checkpoints/DM05 \
   --model-config.chunk-size 50 \
   --trainer-config.per-device-train-batch-size 32 \
@@ -107,10 +104,10 @@ script/dm05_launcher.sh \
   --trainer-config.num-train-steps 100000
 ```
 
-Here, `<MASTER_ADDR>` is the reachable address of the node with rank 0.
+Set `<MASTER_ADDR>` to the rank-0 node's address and ensure port `29500` is
+reachable from every node.
 
-This reference training configuration requires a global batch size of `1024`,
-and `gradient_accumulation_steps` must be `1`:
+The global batch size must be `1024`, with `gradient_accumulation_steps=1`:
 
 ```text
 global batch size = number of nodes x GPUs per node x per-device train batch size x gradient accumulation steps
@@ -118,42 +115,19 @@ global batch size = number of nodes x GPUs per node x per-device train batch siz
                   = 1024
 ```
 
-This configuration cannot be changed to single-node training. If you change the
-number of GPUs or the per-device batch size, make sure that
-`number of nodes x GPUs per node x per-device train batch size = 1024`, while
-keeping `gradient_accumulation_steps=1`.
+This configuration cannot be changed to single-node training. If you adjust
+the GPU count or per-device batch size, retain 4 nodes, a global batch size of
+`1024`, and `gradient_accumulation_steps=1`.
 
-Arguments:
+To sample the archive as one dataset instead of using the default weighted
+views, pass both `--data-config.dataset-name robotwin2_generalist` and
+`--data-config.dataset-weights 1.0`.
 
-- `--exp playground/dm05_robotwin2.py`: RoboTwin 2.0 training and inference
-  entry point. It presets the dataset, action mode, optimizer, and trainer
-  configuration used for this embodiment.
-- `--task train`: starts training.
-- `--nproc_per_node 8`: uses 8 GPUs on each node.
-- `--nnodes 4`: uses 4 nodes for training.
-- `--node_rank <NODE_RANK>`: current node index. Use `0`, `1`, `2`, and `3` for
-  the 4 nodes respectively.
-- `--master_addr <MASTER_ADDR>`: reachable address of the node with rank 0.
-- `--master_port 29500`: rendezvous port for multi-node training. It must be
-  reachable from all nodes.
-- `--data-config.dataset-name robotwin2_generalist`: dataset name registered in
-  `opendm/dataset/robotwin2.py`.
-- `--model-config.model-name-or-path ./checkpoints/DM05`: DM05 base checkpoint.
-- `--model-config.chunk-size 50`: action chunk length. Use the same value for
-  training, inference, and evaluation.
-- `--trainer-config.per-device-train-batch-size 32`: each GPU processes 32
-  samples per forward pass.
-- `--trainer-config.gradient-accumulation-steps 1`: performs an optimizer update
-  after every backward pass. With 4 nodes, 8 GPUs per node, and per-device batch
-  size 32, this fixes the global batch size at 1024.
-- `--trainer-config.num-train-steps 100000`: total number of training steps.
-
-By default, training outputs are written under
-`user_checkpoints/dm05_robotwin2`. Trainer settings such as per-device batch
-size, save interval, output directory, and total training steps can be
-overridden with their corresponding command-line options. When changing the
-per-device batch size or GPU count, keep `gradient_accumulation_steps=1` and
-make sure the global batch size remains `1024`.
+Defaults: output directory `user_checkpoints/dm05_robotwin2`, absolute actions,
+chunk size 50, maximum token length 1152, FSDP1, BF16, and Muon AdamW. Override
+trainer settings with the corresponding CLI options, preserving the batch-size
+constraints above. Keep chunk size consistent across training, inference, and
+evaluation, and use the checkpoint's normalization statistics for inference.
 
 ## RoboTwin 2.0 Inference
 
@@ -163,9 +137,8 @@ See the [DM05 Inference Guide](dm05_inference.md) for the released RoboTwin 2.0 
 
 ### Prepare dexbotic-benchmark
 
-When possible, use one GPU for the inference service and another for the
-RoboTwin 2.0 simulator. The recommended benchmark client is the official Docker
-image:
+Use separate GPUs for inference and simulation when possible. Prepare the
+official benchmark Docker image:
 
 ```bash
 git clone https://github.com/dexmal/dexbotic-benchmark.git
@@ -174,10 +147,9 @@ git submodule update --init --recursive RoboTwin
 docker pull dexmal/dexbotic_benchmark
 ```
 
-RoboTwin 2.0 requires the assets, object-data texture library, and embodiment
-files described in the
+Before evaluation, download the assets, object-data texture library, and
+embodiments following the
 [RoboTwin installation guide](https://robotwin-platform.github.io/doc/usage/robotwin-install.html#4-download-assets-robotwin-od-texture-library-and-embodiments).
-Download these resources before starting evaluation.
 
 ### Configure an Evaluation Task
 
@@ -203,23 +175,16 @@ action_mode: absolute
 
 Important fields:
 
-- `task_name`: one of the 50 RoboTwin 2.0 tasks. Each task is evaluated
-  independently.
-- `task_config`: use `demo_clean` for the Clean setting and `demo_randomized`
-  for the Randomized setting.
-- `base_url`: address of the running DM05 inference service. For a remote
-  service, use `http://<SERVER_IP>:7891`.
-- `cameras`: must remain in head, left-wrist, right-wrist order to match
-  `images_1`, `images_2`, and `images_3`.
-- `action_horizon`: number of actions returned and executed per request. Keep it
-  equal to the model chunk size of 50.
-- `action_mode`: use `absolute` for absolute joint positions and `relative` for
-  relative joint positions. This checkpoint uses `absolute`.
-- `output_dir`: root directory for result files and rollout videos.
+- `task_name`: one of 50 tasks, evaluated independently.
+- `task_config`: `demo_clean` or `demo_randomized`.
+- `base_url`: DM05 service address; use `http://<SERVER_IP>:7891` for a remote service.
+- `cameras`: preserve head, left-wrist, right-wrist order to match `images_1/2/3`.
+- `action_horizon`: actions returned and executed per request; must match chunk size 50.
+- `action_mode`: `absolute` for this checkpoint (absolute joint positions).
+- `output_dir`: result and rollout video directory.
 
-The benchmark runner evaluates 100 episodes for the selected task and setting.
-To reproduce the aggregate Clean and Randomized scores, evaluate all 50 tasks
-under both settings and aggregate their success rates.
+Each task/setting runs 100 episodes. For aggregate Clean and Randomized scores,
+evaluate all 50 tasks in both settings and aggregate their success rates.
 
 ### Run Evaluation with Docker
 
@@ -244,9 +209,8 @@ docker run --rm --gpus all --network host \
 
 ### Run Evaluation Locally
 
-For simulator debugging, install the RoboTwin environment by following
-`dexbotic-benchmark/docs/local_install.md`. After activating its `RoboTwin`
-Conda environment, run:
+For simulator debugging, install the environment using
+`dexbotic-benchmark/docs/local_install.md`, then run:
 
 ```bash
 cd dexbotic-benchmark
@@ -256,11 +220,7 @@ conda activate RoboTwin
 bash scripts/env_sh/robotwin2.sh \
   evaluation/configs/robotwin2/adjust_bottle.yaml
 
-# Or invoke the Python evaluator directly.
-python evaluation/run_robotwin2_evaluation.py \
-  --config evaluation/configs/robotwin2/adjust_bottle.yaml
-
-# Selected configuration values can also be overridden at runtime.
+# Or invoke Python directly, optionally overriding configuration values.
 python evaluation/run_robotwin2_evaluation.py \
   --config evaluation/configs/robotwin2/adjust_bottle.yaml \
   --set base_url http://localhost:7891 \
@@ -277,6 +237,5 @@ Results are written below `output_dir` using the following hierarchy:
 └── *.mp4
 ```
 
-`_result.txt` records the success rate for the selected task and setting. When
-video logging is enabled by the RoboTwin task configuration, the same timestamp
-directory also contains rollout videos.
+`_result.txt` records the task/setting success rate. Rollout videos are saved
+alongside it when video logging is enabled in the RoboTwin task configuration.

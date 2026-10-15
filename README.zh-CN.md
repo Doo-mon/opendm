@@ -22,6 +22,7 @@ OpenDM 提供 DM0.5 的模型权重、训练与推理脚本、数据注册示例
 
 ## 🔥 最新动态
 
+- [2026-10-12] 更新 [RoboTwin2.0 SFT 配置](playground/dm05_robotwin2.py)，新增多任务加权采样、原生 14 维 state/action 归一化补齐、task/subtask prompt 处理。
 - [2026-10-06] 🤗 **DM0.5 已成为 Hugging Face LeRobot 官方支持的模型之一！** 此次集成将 DM0.5 带入 LeRobot 生态，方便更多机器人研究者和开发者使用。欢迎参考 [LeRobot 使用指南](https://huggingface.co/docs/lerobot/main/en/dm05) 开始体验。
 - [2026-10-05] 🏆 **KDDI Research 基于 DM0.5 微调的 VLA-DM0.5 模型登顶** [RoboChallenge Table30 V2](https://robochallenge.cn/) 榜单。
 - [2026-09-23] 已在 XPolicyLab 开源 [OpenDM policy](https://github.com/XPolicyLab/XPolicyLab/tree/main/policy/OpenDM)，提供 RoboDojo 数据转换、基于 DM05-MEM 的 memory SFT，以及已发布 DM05-MEM-Robodojo-Sim 模型的仿真评测流程。

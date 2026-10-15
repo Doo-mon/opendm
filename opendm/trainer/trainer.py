@@ -5,6 +5,7 @@ from typing import Any
 import torch
 import transformers
 from loguru import logger
+from torch.utils.data import ConcatDataset
 from transformers import Trainer, TrainingArguments
 
 from opendm.constants.precision import (
@@ -12,6 +13,7 @@ from opendm.constants.precision import (
     FSDP_MIXED_PRECISION,
     TF32_ENABLED,
 )
+from opendm.data.sampler import WeightedMultiDatasetSampler
 
 
 class DMTrainer(Trainer):
@@ -24,6 +26,22 @@ class DMTrainer(Trainer):
         training_args = self._link_exp_config()
         super().__init__(*args, args=training_args, **kwargs)
         self.loss_cache = {}
+
+    def _get_train_sampler(self, dataset=None):
+        """Use dataset-first weighted sampling for concatenated datasets."""
+        if dataset is None:
+            dataset = self.train_dataset
+        weights = getattr(self.exp_config.data_config, "dataset_weights", None)
+        if weights is not None and isinstance(dataset, ConcatDataset):
+            return WeightedMultiDatasetSampler(
+                datasets=list(dataset.datasets),
+                weights=list(weights),
+                num_samples=getattr(
+                    self.exp_config.data_config, "num_train_samples", None
+                ),
+                seed=getattr(self.args, "seed", 42),
+            )
+        return super()._get_train_sampler(dataset)
 
     def _prepare_for_training(self, *args, **kwargs):
         if not getattr(self.exp_config, "use_lora", False):

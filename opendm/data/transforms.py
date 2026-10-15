@@ -285,12 +285,21 @@ class BuildActionChunk:
             not positive.
     """
 
-    def __init__(self, action_horizon: int):
+    def __init__(self, action_horizon: int, action_source: str = "auto"):
         assert action_horizon > 0, "action_horizon must be greater than 0"
+        if action_source not in {"auto", "state"}:
+            raise ValueError("action_source must be 'auto' or 'state'")
         self.action_horizon = action_horizon
+        self.action_source = action_source
 
     def __str__(self):
-        return f"BuildActionChunk(action_horizon={self.action_horizon})"
+        if self.action_source == "auto":
+            return f"BuildActionChunk(action_horizon={self.action_horizon})"
+        return (
+            "BuildActionChunk("
+            f"action_horizon={self.action_horizon}, "
+            f"action_source={self.action_source!r})"
+        )
 
     def __call__(self, data, **kw):
         assert "state" in data, "BuildActionChunk requires 'state' in data"
@@ -308,7 +317,7 @@ class BuildActionChunk:
         frame_index = meta["frame_index"]
         episode_term = len(lines) - 1
 
-        if "action" in data:
+        if self.action_source == "auto" and "action" in data:
             read_key = "action"
             start = frame_index
         else:
@@ -415,6 +424,7 @@ class BuildAction:
         action_mode: Action representation to produce.
         non_delta_ids: State descriptor names or enum values that should remain
             absolute when ``action_mode`` is ``ActionMode.RELATIVE``.
+        action_source: Source used to build action chunks.
 
     Raises:
         AssertionError: If ``action_horizon`` is not positive or
@@ -430,6 +440,7 @@ class BuildAction:
         non_delta_ids: tuple[RobotStateDesc | str, ...] | list[RobotStateDesc | str] = (
             RobotStateDesc.GRIPPER,
         ),
+        action_source: str = "auto",
     ):
         assert action_horizon > 0, "action_horizon must be greater than 0"
         assert isinstance(
@@ -441,6 +452,7 @@ class BuildAction:
 
         self.action_horizon = action_horizon
         self.action_mode = action_mode
+        self.action_source = action_source
         self.non_delta_ids = {_state_desc_value(desc) for desc in non_delta_ids}
 
         if action_mode == ActionMode.RELATIVE:
@@ -456,7 +468,10 @@ class BuildAction:
     def _build_relative_action_pipeline(self):
         return Pipeline(
             [
-                BuildActionChunk(self.action_horizon),
+                BuildActionChunk(
+                    self.action_horizon,
+                    action_source=self.action_source,
+                ),
                 ActionRelative(non_delta_ids=list(self.non_delta_ids)),
             ]
         )
@@ -464,7 +479,10 @@ class BuildAction:
     def _build_absolute_action_pipeline(self):
         return Pipeline(
             [
-                BuildActionChunk(self.action_horizon),
+                BuildActionChunk(
+                    self.action_horizon,
+                    action_source=self.action_source,
+                ),
             ]
         )
 
@@ -669,6 +687,8 @@ class ChatTokenization:
             ``history_pixel_values`` / ``history_mask``.
         max_history_images: History slot count when ``is_history`` is set.
         enable_logging: Whether to log the decoded tokenized prompt.
+        prompt_is_formatted: Whether the prompt already contains task/subtask
+            labels and punctuation.
     """
 
     def __init__(
@@ -681,6 +701,7 @@ class ChatTokenization:
         is_history: bool = False,
         max_history_images: int = 32,
         enable_logging: bool = False,
+        prompt_is_formatted: bool = False,
     ):
         self.processor = processor
         self.tokenizer = (
@@ -693,6 +714,7 @@ class ChatTokenization:
         self.is_history = is_history
         self.max_history_images = max_history_images
         self.enable_logging = enable_logging
+        self.prompt_is_formatted = prompt_is_formatted
         self.history_placeholder_token_id = self.tokenizer.convert_tokens_to_ids(
             "<unused0>"
         )
@@ -731,7 +753,10 @@ class ChatTokenization:
             f"Expected speed to be a string, got {type(speed)}"
         )
         text_parts.append(f"Overall speed: {speed}\n")
-        text_parts.append(f"Task: {data['prompt']}.\n")
+        if self.prompt_is_formatted:
+            text_parts.append(f"{data['prompt']}\n")
+        else:
+            text_parts.append(f"Task: {data['prompt']}.\n")
         user_content = [{"type": "text", "text": "".join(text_parts)}]
 
         history_pixel_values = None
@@ -836,7 +861,7 @@ class ChatTokenization:
             # Match dexbotic: mark ``<unused0>`` history slots as image tokens (type=1).
             token_type_ids = token_type_ids.clone()
             token_type_ids[history_mask] = 1
-        return {
+        output = {
             "action": torch.from_numpy(data["action"]) if "action" in data else None,
             "action_mask": (
                 torch.from_numpy(data["action_mask"]) if "action_mask" in data else None
@@ -848,6 +873,7 @@ class ChatTokenization:
             "history_pixel_values": history_pixel_values,
             "history_mask": history_mask,
         }
+        return output
 
 
 class VLMChatTokenization:
@@ -934,6 +960,10 @@ class PadAction:
         if arr.shape[-1] >= ndim:
             return arr[..., :ndim]
         pad = ndim - arr.shape[-1]
+        if isinstance(arr, np.ndarray):
+            pad_width = [(0, 0)] * arr.ndim
+            pad_width[-1] = (0, pad)
+            return np.pad(arr, pad_width, constant_values=pad_value)
         return torch.nn.functional.pad(arr, (0, pad), value=pad_value)
 
 

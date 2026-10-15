@@ -1,5 +1,6 @@
 import json
 import os
+import random
 
 import megfile
 import orjson
@@ -15,11 +16,19 @@ class JsonlDataset(Dataset):
         transforms=None,
         dataset_name: str | None = None,
         dataset_meta: dict | None = None,
+        drop_last_frame: bool = True,
+        tail_resample_count: int = 0,
+        tail_global_resample_count: int = 0,
     ):
         self.jsonl_dir = jsonl_dir
         self.transforms = transforms
         self.dataset_name = dataset_name
         self.dataset_meta = {} if dataset_meta is None else dataset_meta
+        self.drop_last_frame = bool(drop_last_frame)
+        self.tail_resample_count = int(tail_resample_count)
+        self.tail_global_resample_count = int(tail_global_resample_count)
+        if self.tail_resample_count < 0 or self.tail_global_resample_count < 0:
+            raise ValueError("tail resample counts must be non-negative")
         self._build_index()
 
     def _build_index(self):
@@ -31,7 +40,8 @@ class JsonlDataset(Dataset):
         file_id_counter = 0
         for jsonl_file, num_samples in file_to_nsamples.items():
             file_to_id[jsonl_file] = file_id_counter
-            for frame_index in range(max(0, num_samples - 1)):
+            length_decrease = 1 if self.drop_last_frame else 0
+            for frame_index in range(max(0, num_samples - length_decrease)):
                 sample_index.append((file_id_counter, frame_index))
             file_id_counter += 1
         self.sample_index = sample_index
@@ -49,6 +59,26 @@ class JsonlDataset(Dataset):
         file_index, frame_index = self.sample_index[idx]
         jsonl_file = self.id_to_jsonl[file_index]
         lines = _read_jsonl_lines(jsonl_file)
+        if (
+            self.tail_resample_count
+            and frame_index >= len(lines) - self.tail_resample_count
+        ):
+            last_safe_index = len(lines) - self.tail_resample_count - 1
+            if last_safe_index < 0:
+                raise ValueError(
+                    f"Episode {jsonl_file} has {len(lines)} frames, fewer than "
+                    f"tail_resample_count={self.tail_resample_count}"
+                )
+            frame_index = random.randint(0, last_safe_index)
+        if (
+            self.tail_global_resample_count
+            and frame_index >= len(lines) - self.tail_global_resample_count
+        ):
+            # Match DM05Dataset: after its in-episode final-two-frame retry,
+            # samples in the final three frames are retried from the complete
+            # dataset. The recursive call intentionally preserves its RNG
+            # consumption and permits the retry to come from another episode.
+            return self.__getitem__(random.randint(0, len(self) - 1))
         result = orjson.loads(lines[frame_index])
         result["raw_lines"] = lines
         result["meta_data"] = {

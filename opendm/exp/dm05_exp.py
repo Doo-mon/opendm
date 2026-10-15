@@ -15,6 +15,7 @@ from typing import Literal
 
 import numpy as np
 import torch
+import tyro
 from flask import Flask, jsonify, request
 from loguru import logger
 from PIL import Image, UnidentifiedImageError
@@ -1628,8 +1629,6 @@ class DM05Exp(Config):
 
 
 if __name__ == "__main__":
-    import tyro
-
     exp = tyro.cli(DM05Exp)
     if exp.task == "train":
         exp.train()

@@ -30,6 +30,12 @@ LIBERO 的 episode 文件位于其注册 `jsonl_dir` 下的 `jsonl/` 子目录�
 `opendm/dataset/robodojo.py` 中的注册配置一致。如果数据位于其他位置，训练时可传入 `--data-config.jsonl-dir`
 和 `--data-config.image-dir`。
 
+同一份公开 RoboTwin 2.0 数据包还被注册为 100 个
+`robotwin2_component_<task>_<setting>` 组件视图。每个视图指向
+`./data/robotwin2.0/jsonl/<task>/<setting>`，并共用数据包内的 `video/` 目录。
+`playground/dm05_robotwin2.py` 中的加权参考 SFT 配方会按预设权重组合这些视图，
+无需准备另一份数据集或配置远程数据根目录。
+
 ## 2. 数据集目录结构
 
 每个 episode 使用一个独立的 `.jsonl` 文件。媒体文件可以位于同一数据根目录

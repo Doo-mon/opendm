@@ -33,6 +33,13 @@ These locations match `opendm/dataset/libero.py`,
 stored elsewhere, pass `--data-config.jsonl-dir` and `--data-config.image-dir`
 when training.
 
+The same public RoboTwin 2.0 archive is also registered as 100 component views
+named `robotwin2_component_<task>_<setting>`. Each view points to a
+`jsonl/<task>/<setting>` directory inside `./data/robotwin2.0` and shares the
+archive's `video/` directory. The weighted reference SFT recipe in
+`playground/dm05_robotwin2.py` combines these views with preset sampling
+weights; it does not require another dataset or a remote data root.
+
 ## 2. Dataset Layout
 
 Store each episode in a separate `.jsonl` file. Media files may live below the
