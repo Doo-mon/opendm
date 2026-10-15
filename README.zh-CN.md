@@ -286,6 +286,7 @@ script/dm05_launcher.sh \
 微调模型启动命令、fast backend 配置、运行约束和问题排查参考
 [DM05 推理指南](docs/zh/dm05_inference.md)。
 新的接入方优先使用 `/v1/infer`。旧的 `/process_frame` multipart 接口仍作为 legacy 兼容路径保留，但会逐步被替换。
+通用 VLM benchmark 可以使用兼容 OpenAI 的 [`/v1/chat/completions` 多模态对话接口](docs/zh/dm05_inference.md#vlm-chat-completions-接口)。
 
 ## 训练
 

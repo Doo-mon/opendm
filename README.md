@@ -293,6 +293,7 @@ This example uses three images and a 14-dimensional state/action. See the
 HTTP request fields, fine-tuned checkpoint commands, fast backend setup,
 runtime constraints, and troubleshooting.
 Use `/v1/infer` for new integrations. The older `/process_frame` multipart API remains available as a legacy compatibility path and will be phased out over time.
+General VLM benchmarks can use the OpenAI-compatible [`/v1/chat/completions` multimodal chat API](docs/en/dm05_inference.md#vlm-chat-completions-api).
 
 ## Training
 

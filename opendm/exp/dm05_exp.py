@@ -1,11 +1,13 @@
 import base64
 import binascii
+import copy
 import hashlib
 import json
 import os
 import pathlib
 import sys
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from enum import Enum
 from io import BytesIO
@@ -13,7 +15,6 @@ from typing import Literal
 
 import numpy as np
 import torch
-import tyro
 from flask import Flask, jsonify, request
 from loguru import logger
 from PIL import Image, UnidentifiedImageError
@@ -45,6 +46,7 @@ from opendm.data.transforms import (
     Pipeline,
     PixelTransform,
     ToDevice,
+    VLMChatTokenization,
 )
 from opendm.dataset.register import CONVERSATION_DATA
 from opendm.model.dm05.dm05_arch import DM05Config, DM05ForConditionalGeneration
@@ -90,6 +92,8 @@ class DM05ModelConfig(Config):
     freeze_vlm_embedding: bool = field(default=True)
     vlm_gradient_checkpointing: bool = field(default=True)
     ae_gradient_checkpointing: bool = field(default=True)
+    align_action_rope_to_language: bool = field(default=False)
+    sync_vlm_config_dtype_to_load_dtype: bool = field(default=False)
     lora_config: DM05LoraConfig = field(default_factory=DM05LoraConfig)
 
     def _config_overrides(self) -> dict:
@@ -104,8 +108,57 @@ class DM05ModelConfig(Config):
             return MODEL_DTYPE
         raise ValueError(f"Invalid precision_policy: {self.precision_policy!r}")
 
+    def _apply_attention_config_before_load(self, config: DM05Config) -> None:
+        vlm_attention = config.vlm_config._attn_implementation
+        if isinstance(vlm_attention, dict):
+            vlm_attention = dict(vlm_attention)
+        elif vlm_attention is None:
+            vlm_attention = {}
+        else:
+            vlm_attention = {"": vlm_attention}
+
+        if self.llm_attn_implementation != "auto":
+            vlm_attention[""] = self.llm_attn_implementation
+            vlm_attention["text_config"] = self.llm_attn_implementation
+        if self.vision_attn_implementation != "auto":
+            vlm_attention["vision_config"] = self.vision_attn_implementation
+        config.vlm_config._attn_implementation = vlm_attention
+
+        if self.action_attn_implementation != "auto":
+            config.action_config._attn_implementation = self.action_attn_implementation
+        logger.info(
+            "Configured attention before model construction: "
+            f"LLM={self.llm_attn_implementation}, "
+            f"Vision={self.vision_attn_implementation}, "
+            f"Action={self.action_attn_implementation}"
+        )
+
+    def _apply_load_dtype_to_vlm_config(self, config: DM05Config) -> None:
+        if not self.sync_vlm_config_dtype_to_load_dtype:
+            return
+
+        load_dtype = self._torch_dtype()
+        config.vlm_config.dtype = load_dtype
+        config.vlm_config.text_config.dtype = load_dtype
+        config.vlm_config.vision_config.dtype = load_dtype
+        logger.info(
+            "Synchronized VLM config dtype to checkpoint load dtype: "
+            f"VLM={load_dtype}, Text={load_dtype}, Vision={load_dtype}"
+        )
+
     def _load_base_checkpoint_model(self) -> DM05ForConditionalGeneration:
         config = DM05Config.from_pretrained(self.model_name_or_path)
+        self._apply_attention_config_before_load(config)
+        self._apply_load_dtype_to_vlm_config(config)
+        if self.align_action_rope_to_language:
+            config.action_config.rope_parameters = copy.deepcopy(
+                config.vlm_config.text_config.rope_parameters
+            )
+            logger.warning(
+                "Aligning action expert RoPE parameters to the VLM language "
+                "configuration for chat-only inference; the action expert does "
+                "not participate in this inference path."
+            )
         for attr, value in self._config_overrides().items():
             setattr(config, attr, value)
         return DM05ForConditionalGeneration.from_pretrained(
@@ -515,6 +568,10 @@ class DM05InferenceConfig(Config):
     vision_trt_engine_path: str | None = field(default=None)
     force_rebuild: bool = field(default=False)
     prefix_seq_len_buckets: list[int] | None = field(default=None)
+    chat_only: bool = field(default=False)
+    enable_vlm_chat: bool = field(default=True)
+    chat_max_new_tokens: int = field(default=2048)
+    chat_max_input_tokens: int = field(default=8192)
     clip_to_bounds: bool = field(default=True)
     compose_eef_rot: bool = field(default=False)
     full_action_mask: bool = field(default=False)
@@ -558,6 +615,18 @@ class DM05InferenceConfig(Config):
         else:
             self.device = torch.device("cpu")
 
+        if self.chat_only:
+            model.eval()
+            model.to(self.device)
+            self.model = model
+            self.processor = AutoProcessor.from_pretrained(
+                model_name_or_path,
+                trust_remote_code=True,
+            )
+            self.vlm_chat_tokenization = VLMChatTokenization(self.processor)
+            logger.info("Model loaded successfully")
+            return
+
         self.use_absolute_action = use_absolute_action
         self.last_model_latency_sec = None
         self.default_robot_type = self._request_default("default_robot_type")
@@ -570,6 +639,12 @@ class DM05InferenceConfig(Config):
         self.fast_runtime = None
         transform_max_length = model_max_length
         if self.backend == "fast":
+            if self.enable_vlm_chat:
+                logger.warning(
+                    "VLM chat uses the standard PyTorch generation path; "
+                    "the fast backend only accelerates action inference."
+                )
+
             from opendm.infer.dm05_infer import DM05FastInferRuntime
             from opendm.infer.dm05_trt_utils import ensure_dm05_fast_inference_engine
 
@@ -610,6 +685,7 @@ class DM05InferenceConfig(Config):
             model_name_or_path,
             trust_remote_code=True,
         )
+        self.vlm_chat_tokenization = VLMChatTokenization(self.processor)
         logger.info("Model loaded successfully")
 
         self.norm_stats_file = normalize.load_norm_stats_file(norm_stats_path)
@@ -1074,6 +1150,275 @@ class DM05InferenceConfig(Config):
             logger.warning(f"process_frame bad request: {message}")
             return jsonify({"error": message}), 400
 
+    def _decode_chat_messages(self, messages: list) -> list[dict]:
+        if not isinstance(messages, list) or not messages:
+            raise ValueError("messages must be a non-empty JSON array")
+
+        decoded_messages = []
+        for message_index, message in enumerate(messages):
+            field = f"messages[{message_index}]"
+            if not isinstance(message, dict):
+                raise ValueError(f"{field} must be a JSON object")
+
+            role = message.get("role")
+            if role not in {"system", "user", "assistant"}:
+                raise ValueError(
+                    f"{field}.role must be one of system, user, or assistant"
+                )
+
+            content = message.get("content")
+            if isinstance(content, str):
+                content_parts = [{"type": "text", "text": content}]
+            elif isinstance(content, list):
+                content_parts = content
+            else:
+                raise ValueError(f"{field}.content must be a string or JSON array")
+
+            decoded_content = []
+            for part_index, part in enumerate(content_parts):
+                part_field = f"{field}.content[{part_index}]"
+                if not isinstance(part, dict):
+                    raise ValueError(f"{part_field} must be a JSON object")
+
+                part_type = part.get("type")
+                if part_type == "text":
+                    text = part.get("text")
+                    if not isinstance(text, str):
+                        raise ValueError(f"{part_field}.text must be a string")
+                    decoded_content.append({"type": "text", "text": text})
+                elif part_type == "image_url":
+                    image_url = part.get("image_url")
+                    if not isinstance(image_url, dict):
+                        raise ValueError(
+                            f"{part_field}.image_url must be a JSON object"
+                        )
+                    url = image_url.get("url")
+                    if not isinstance(url, str):
+                        raise ValueError(f"{part_field}.image_url.url must be a string")
+                    if url.lower().startswith(("http://", "https://")):
+                        raise ValueError(
+                            f"{part_field}.image_url.url only supports a data URL "
+                            "or raw base64; external HTTP URLs are not supported"
+                        )
+                    decoded_content.append(
+                        {
+                            "type": "image",
+                            "image": self._decode_b64_image(
+                                url,
+                                f"{part_field}.image_url.url",
+                            ),
+                        }
+                    )
+                elif part_type in {"video_url", "audio_url"}:
+                    raise ValueError(f"{part_type} content is not supported")
+                else:
+                    raise ValueError(
+                        f"{part_field}.type must be text or image_url; "
+                        f"got {part_type!r}"
+                    )
+
+            decoded_messages.append({"role": role, "content": decoded_content})
+        return decoded_messages
+
+    def _health(self):
+        return jsonify({"status": "ok"})
+
+    def _chat(self):
+        if not self.enable_vlm_chat:
+            return jsonify({"error": "VLM chat is disabled on this server"}), 501
+
+        try:
+            body = request.get_json(force=True)
+            if not isinstance(body, dict):
+                raise ValueError("request body must be a JSON object")
+            if body.get("stream", False):
+                raise ValueError("streaming responses are not supported")
+
+            request_t0 = time.monotonic()
+            messages = self._decode_chat_messages(body.get("messages"))
+            model_input = self.vlm_chat_tokenization({"messages": messages})
+            prompt_tokens = int(model_input["input_ids"].shape[1])
+            if prompt_tokens > self.chat_max_input_tokens:
+                raise ValueError(
+                    f"input prompt has {prompt_tokens} tokens, exceeding the "
+                    f"limit of {self.chat_max_input_tokens}"
+                )
+
+            requested_max_tokens = body.get("max_tokens")
+            if requested_max_tokens is None:
+                requested_max_tokens = body.get("max_completion_tokens", 1024)
+            if (
+                isinstance(requested_max_tokens, bool)
+                or not isinstance(requested_max_tokens, (int, float))
+                or int(requested_max_tokens) != requested_max_tokens
+                or requested_max_tokens <= 0
+            ):
+                raise ValueError("max_tokens must be a positive integer")
+            max_new_tokens = int(requested_max_tokens)
+            if max_new_tokens > self.chat_max_new_tokens:
+                logger.warning(
+                    "Clamping chat max tokens from {} to {}",
+                    max_new_tokens,
+                    self.chat_max_new_tokens,
+                )
+                max_new_tokens = self.chat_max_new_tokens
+
+            temperature = body.get("temperature", 0)
+            if temperature is None:
+                temperature = 0
+            if (
+                isinstance(temperature, bool)
+                or not isinstance(temperature, (int, float))
+                or temperature < 0
+            ):
+                raise ValueError("temperature must be a non-negative number")
+            temperature = float(temperature)
+            do_sample = temperature > 0
+
+            top_p = None
+            if do_sample:
+                top_p = body.get("top_p", 0.95)
+                if (
+                    isinstance(top_p, bool)
+                    or not isinstance(top_p, (int, float))
+                    or not 0 < top_p <= 1
+                ):
+                    raise ValueError("top_p must be greater than 0 and at most 1")
+                top_p = float(top_p)
+
+            stop = body.get("stop")
+            if stop is None:
+                stop_sequences = []
+            elif isinstance(stop, str):
+                stop_sequences = [stop]
+            elif isinstance(stop, list) and all(isinstance(item, str) for item in stop):
+                stop_sequences = stop
+            else:
+                raise ValueError("stop must be a string or an array of strings")
+            if any(not item for item in stop_sequences):
+                raise ValueError("stop strings must not be empty")
+
+            model_name = body.get("model", "dm05")
+            if not isinstance(model_name, str) or not model_name:
+                raise ValueError("model must be a non-empty string")
+
+            tokenizer = self.processor.tokenizer
+            eos_token_ids = []
+            tokenizer_eos = tokenizer.eos_token_id
+            if isinstance(tokenizer_eos, (list, tuple)):
+                eos_candidates = list(tokenizer_eos)
+            else:
+                eos_candidates = [tokenizer_eos]
+            eos_candidates.append(tokenizer.convert_tokens_to_ids("<end_of_turn>"))
+            for token_id in eos_candidates:
+                if token_id is None or token_id == tokenizer.unk_token_id:
+                    continue
+                token_id = int(token_id)
+                if token_id not in eos_token_ids:
+                    eos_token_ids.append(token_id)
+
+            generation_input = {
+                key: value.to(self.device) if value is not None else None
+                for key, value in model_input.items()
+            }
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            model_t0 = time.perf_counter()
+            try:
+                if do_sample:
+                    rng_devices = (
+                        [self.device.index] if self.device.type == "cuda" else []
+                    )
+                    rng_context = torch.random.fork_rng(devices=rng_devices)
+                else:
+                    rng_context = nullcontext()
+                dm05_model = unwrap_dm05_model(self.model)
+                with (
+                    rng_context,
+                    dm05_inference_context(self.device, dm05_model.precision_policy),
+                ):
+                    if do_sample:
+                        torch.manual_seed(int.from_bytes(os.urandom(8), "big"))
+                    output = dm05_model.generate_text(
+                        input_ids=generation_input["input_ids"],
+                        attention_mask=generation_input["attention_mask"],
+                        pixel_values=generation_input["pixel_values"],
+                        token_type_ids=generation_input["token_type_ids"],
+                        max_new_tokens=max_new_tokens,
+                        do_sample=do_sample,
+                        temperature=temperature if do_sample else None,
+                        top_p=top_p,
+                        stop_strings=stop_sequences or None,
+                        tokenizer=tokenizer,
+                        eos_token_id=eos_token_ids or None,
+                        pad_token_id=tokenizer.pad_token_id,
+                    )
+            except Exception as exc:
+                message = (
+                    f"VLM chat generation failed: {exc}. Retry with "
+                    "--inference-config.backend default"
+                )
+                logger.exception(f"v1/chat/completions generation error: {exc}")
+                return jsonify({"error": message}), 500
+
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            model_latency_sec = time.perf_counter() - model_t0
+
+            text = tokenizer.decode(output.token_ids, skip_special_tokens=True)
+            finish_reason = output.finish_reason
+            stop_index = None
+            for stop_sequence in stop_sequences:
+                candidate_index = text.find(stop_sequence)
+                if candidate_index >= 0 and (
+                    stop_index is None or candidate_index < stop_index
+                ):
+                    stop_index = candidate_index
+            if stop_index is not None:
+                text = text[:stop_index]
+                finish_reason = "stop"
+
+            latency_ms = round((time.monotonic() - request_t0) * 1000, 1)
+            completion_tokens = int(len(output.token_ids))
+            prompt_tokens = int(output.prompt_tokens)
+            logger.info(
+                "v1/chat/completions processing time: {:.3f}s, model_latency_ms={:.3f}",
+                latency_ms / 1000.0,
+                model_latency_sec * 1000.0,
+            )
+            return jsonify(
+                {
+                    "id": "chatcmpl-" + hashlib.sha256(os.urandom(16)).hexdigest()[:8],
+                    "object": "chat.completion",
+                    "created": int(time.time()),
+                    "model": model_name,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": text},
+                            "finish_reason": finish_reason,
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": prompt_tokens,
+                        "completion_tokens": completion_tokens,
+                        "total_tokens": prompt_tokens + completion_tokens,
+                    },
+                    "metadata": {"latency_ms": latency_ms},
+                }
+            )
+        except (BadRequest, TypeError, ValueError, json.JSONDecodeError) as exc:
+            message = exc.description if isinstance(exc, BadRequest) else str(exc)
+            logger.warning(f"v1/chat/completions bad request: {message}")
+            return jsonify({"error": message}), 400
+        except Exception as exc:
+            message = (
+                f"VLM chat generation failed: {exc}. Retry with "
+                "--inference-config.backend default"
+            )
+            logger.exception(f"v1/chat/completions generation error: {exc}")
+            return jsonify({"error": message}), 500
+
 
 @dataclass
 class DM05Exp(Config):
@@ -1175,8 +1520,16 @@ class DM05Exp(Config):
 
     def _initialize_inference_runtime(self) -> None:
         """Build the model and transforms shared by inference entry points."""
-        use_fast_backend = self.inference_config.backend == "fast"
-        if use_fast_backend or self.inference_config.prefix_seq_len_buckets:
+        self.model_config.align_action_rope_to_language = (
+            self.inference_config.chat_only
+        )
+        use_fast_backend = (
+            self.inference_config.backend == "fast"
+            and not self.inference_config.chat_only
+        )
+        if not self.inference_config.chat_only and (
+            use_fast_backend or self.inference_config.prefix_seq_len_buckets
+        ):
             from opendm.infer.dm05_infer import DM05FastInferRuntime
 
             DM05FastInferRuntime.resolve_prefix_seq_len_buckets(
@@ -1191,6 +1544,17 @@ class DM05Exp(Config):
         )
         logger.info(f"Loading model from {self.model_config.model_name_or_path}")
         model = self.model_config.build_model(use_lora=self.use_lora)
+        if self.inference_config.chat_only:
+            self.inference_config._initialize(
+                model=model,
+                model_name_or_path=self.model_config.model_name_or_path,
+                norm_stats_path="",
+                n_bins=0,
+                model_max_length=0,
+                use_absolute_action=False,
+            )
+            return
+
         ckpt_norm_stats_path = (
             pathlib.Path(self.model_config.model_name_or_path) / "norm_stats.json"
         )
@@ -1231,15 +1595,28 @@ class DM05Exp(Config):
         self._initialize_inference_runtime()
         app = Flask(__name__)
         app.add_url_rule(
-            "/process_frame",
-            "process_frame",
-            self.inference_config._infer_legacy,
-            methods=["POST"],
+            "/health",
+            "health",
+            self.inference_config._health,
+            methods=["GET"],
         )
+        if not self.inference_config.chat_only:
+            app.add_url_rule(
+                "/process_frame",
+                "process_frame",
+                self.inference_config._infer_legacy,
+                methods=["POST"],
+            )
+            app.add_url_rule(
+                "/v1/infer",
+                "v1_infer",
+                self.inference_config._infer,
+                methods=["POST"],
+            )
         app.add_url_rule(
-            "/v1/infer",
-            "v1_infer",
-            self.inference_config._infer,
+            "/v1/chat/completions",
+            "v1_chat",
+            self.inference_config._chat,
             methods=["POST"],
         )
         app.run(
@@ -1251,6 +1628,8 @@ class DM05Exp(Config):
 
 
 if __name__ == "__main__":
+    import tyro
+
     exp = tyro.cli(DM05Exp)
     if exp.task == "train":
         exp.train()

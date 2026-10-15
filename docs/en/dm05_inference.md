@@ -461,6 +461,163 @@ bash tests/curl_demo.sh http://127.0.0.1:7891/v1/infer Aloha
 bash tests/curl_history.sh http://127.0.0.1:7891/v1/infer
 ```
 
+### VLM Chat Completions API
+
+`POST /v1/chat/completions` implements the OpenAI Chat Completions response
+schema for multimodal VLM evaluation. Unlike `/v1/infer`, this endpoint returns
+text, does not require robot state, accepts any number of images interleaved
+with text, and does not add the `Robot:`, `Control mode:`, `Overall speed:`,
+`Task:`, or `States:` action-inference prefixes. Both endpoints reuse the same
+loaded checkpoint and processor.
+
+A request can contain plain-string content or OpenAI-style content parts:
+
+```bash
+curl -X POST http://127.0.0.1:7891/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  --data @- <<'EOF'
+{
+  "model": "dm05",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {"type": "text", "text": "Describe this image."},
+        {
+          "type": "image_url",
+          "image_url": {"url": "data:image/png;base64,<base64-image>"}
+        }
+      ]
+    }
+  ],
+  "max_tokens": 128,
+  "temperature": 0
+}
+EOF
+```
+
+Images must be data URLs or raw base64 strings. External HTTP(S) image URLs
+are rejected, and video/audio parts are not supported. `max_tokens` and
+`max_completion_tokens` are both accepted; the default is 1024. A zero or
+omitted `temperature` uses greedy decoding, while a positive value enables
+sampling. `stop` accepts a string or string array. Unknown top-level fields are
+ignored for lmms-eval compatibility, but `stream: true` is rejected because the
+server does not implement SSE.
+
+A successful response follows the OpenAI schema:
+
+```json
+{
+  "id": "chatcmpl-1a2b3c4d",
+  "object": "chat.completion",
+  "created": 1785000000,
+  "model": "dm05",
+  "choices": [
+    {
+      "index": 0,
+      "message": {"role": "assistant", "content": "A robot workcell..."},
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 812,
+    "completion_tokens": 37,
+    "total_tokens": 849
+  },
+  "metadata": {"latency_ms": 1234.5}
+}
+```
+
+VLM chat configuration:
+
+- `--inference-config.enable-vlm-chat`: enable the endpoint; defaults to `true`.
+- `--inference-config.chat-max-new-tokens`: server-side output cap; defaults to
+  2048. Larger request values are clamped with a warning.
+- `--inference-config.chat-max-input-tokens`: maximum tokenized prompt length;
+  defaults to 8192. Longer prompts return HTTP 400.
+
+With `--inference-config.backend fast`, action inference still uses the fast
+runtime, but chat generation deliberately uses the standard PyTorch VLM path.
+If chat generation fails in that configuration, retry with
+`--inference-config.backend default`.
+
+To run an image benchmark through the lmms-eval OpenAI backend:
+
+```bash
+OPENAI_API_KEY=EMPTY python3 -m lmms_eval \
+  --model openai \
+  --model_args model=dm05,base_url=http://127.0.0.1:7891/v1,api_key=EMPTY,num_concurrent=1 \
+  --tasks mme \
+  --batch_size 1 \
+  --log_samples \
+  --output_path ./lmms_results/dm05
+```
+
+Use `num_concurrent=1` to `4` for this service. For tasks whose `max_tokens` is
+in the thousands, always use `num_concurrent=1`: Flask runs this server serially
+with `threaded=False`. With lmms-eval's default 32-way concurrency, requests at
+the back of the queue can hit the OpenAI SDK's default 600-second timeout, and
+the resulting retries can overload the queue further.
+
+#### GPU acceptance test
+
+On a GPU machine with the LIBERO checkpoint, start the default backend:
+
+```bash
+script/dm05_launcher.sh \
+  --exp playground/dm05_libero.py \
+  --task inference \
+  --model-config.model-name-or-path ./checkpoints/DM05-libero \
+  --model-config.chunk-size 10 \
+  --inference-config.backend default \
+  --inference-config.output-action-dim 7 \
+  --inference-config.image-prompts "Head" "Left wrist" \
+  --inference-config.port 7891
+```
+
+In another shell, run:
+
+```bash
+bash tests/curl_chat.sh
+```
+
+Expect one JSON object with `object: "chat.completion"`, a non-empty assistant
+`content`, `finish_reason` equal to `"stop"` or `"length"`, and integer values
+for all three `usage` fields. Then verify that openai-python accepts and
+validates the response:
+
+```python
+import base64
+from pathlib import Path
+
+from openai import OpenAI
+
+image = base64.b64encode(
+    Path("assets/demo/images/episode0/cam_high/0.jpg").read_bytes()
+).decode("ascii")
+client = OpenAI(base_url="http://127.0.0.1:7891/v1", api_key="EMPTY")
+completion = client.chat.completions.create(
+    model="dm05",
+    messages=[
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Describe the scene."},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{image}"},
+                },
+            ],
+        }
+    ],
+    max_tokens=128,
+    temperature=0,
+)
+print(type(completion).__name__)  # ChatCompletion
+print(completion.choices[0].message.content)
+print(completion.usage)
+```
+
 ### Legacy `/process_frame` API
 
 The legacy compatibility endpoint accepts `multipart/form-data` with repeated

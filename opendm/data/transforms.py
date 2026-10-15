@@ -850,6 +850,70 @@ class ChatTokenization:
         }
 
 
+class VLMChatTokenization:
+    """Tokenize a general multimodal conversation for Gemma3 generation."""
+
+    def __init__(self, processor) -> None:
+        self.processor = processor
+
+    @staticmethod
+    def _merge_system_messages(messages: list[dict]) -> list[dict]:
+        system_content = []
+        normalized = []
+        for message in messages:
+            copied_content = [dict(part) for part in message["content"]]
+            if message["role"] == "system":
+                if system_content:
+                    system_content.append({"type": "text", "text": "\n\n"})
+                system_content.extend(copied_content)
+            else:
+                normalized.append({"role": message["role"], "content": copied_content})
+
+        if not system_content:
+            return normalized
+
+        for message in normalized:
+            if message["role"] == "user":
+                message["content"] = [
+                    *system_content,
+                    {"type": "text", "text": "\n\n"},
+                    *message["content"],
+                ]
+                return normalized
+        raise ValueError("messages with a system role must include a user message")
+
+    def __call__(self, data: dict) -> dict:
+        """Tokenize ``data['messages']`` without robot-specific scaffolding."""
+        messages = data["messages"]
+        try:
+            inputs = self.processor.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_dict=True,
+                return_tensors="pt",
+            )
+        except Exception:
+            if not any(message["role"] == "system" for message in messages):
+                raise
+            # Some Gemma3 checkpoint templates reject the system role. Preserve
+            # its content by prefixing it to the first user turn and retry once.
+            messages = self._merge_system_messages(messages)
+            inputs = self.processor.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_dict=True,
+                return_tensors="pt",
+            )
+        return {
+            "input_ids": inputs["input_ids"],
+            "attention_mask": inputs.get("attention_mask"),
+            "pixel_values": inputs.get("pixel_values"),
+            "token_type_ids": inputs.get("token_type_ids"),
+        }
+
+
 class PadAction:
     """Pad or truncate the last action dimension to a shared size.
 

@@ -411,6 +411,13 @@ class DM05SuffixGraphProfile:
     graph: torch.cuda.CUDAGraph | None = None
 
 
+@dataclass
+class DM05TextGenerationOutput:
+    token_ids: list[int]
+    prompt_tokens: int
+    finish_reason: Literal["stop", "length"]
+
+
 # ---------------------------------------------------------------------------
 # Model
 # ---------------------------------------------------------------------------
@@ -1419,6 +1426,145 @@ class DM05ForConditionalGeneration(DMPreTrainedModel):
         self._suffix_graph_profiles.clear()
         self._suffix_graph_candidates.clear()
         self._suffix_graph_disabled_profiles.clear()
+
+    @torch.no_grad()
+    def generate_text_batch(
+        self,
+        *,
+        input_ids: torch.LongTensor,
+        attention_mask: torch.Tensor | None = None,
+        pixel_values: torch.Tensor | None = None,
+        token_type_ids: torch.LongTensor | None = None,
+        max_new_tokens: int = 1024,
+        do_sample: bool = False,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        stop_strings: list[str] | None = None,
+        tokenizer=None,
+        eos_token_id: int | list[int] | None = None,
+        pad_token_id: int | None = None,
+    ) -> list[DM05TextGenerationOutput]:
+        """Generate text for a padded batch with the underlying Gemma3 VLM."""
+        if input_ids.ndim != 2 or input_ids.shape[0] < 1:
+            raise ValueError(
+                "input_ids must have shape [batch, sequence] with a non-empty batch"
+            )
+
+        batch_size = int(input_ids.shape[0])
+        prompt_width = int(input_ids.shape[1])
+        if attention_mask is None:
+            prompt_token_counts = [prompt_width] * batch_size
+        else:
+            prompt_token_counts = [
+                int(count)
+                for count in attention_mask.to(dtype=torch.int64).sum(dim=1).tolist()
+            ]
+
+        generation_kwargs: dict[str, Any] = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "max_new_tokens": max_new_tokens,
+            "do_sample": do_sample,
+            "use_cache": True,
+            "return_dict_in_generate": True,
+        }
+        if stop_strings:
+            generation_kwargs["stop_strings"] = stop_strings
+            generation_kwargs["tokenizer"] = tokenizer
+        if eos_token_id is not None and eos_token_id != []:
+            generation_kwargs["eos_token_id"] = eos_token_id
+        if pad_token_id is not None:
+            generation_kwargs["pad_token_id"] = pad_token_id
+        if pixel_values is not None:
+            pixel_values = pixel_values.to(
+                device=input_ids.device,
+                dtype=next(self.model.vlm.model.vision_tower.parameters()).dtype,
+            )
+            generation_kwargs["pixel_values"] = pixel_values
+        if token_type_ids is not None:
+            generation_kwargs["token_type_ids"] = token_type_ids
+        if do_sample:
+            if temperature is not None:
+                generation_kwargs["temperature"] = temperature
+            if top_p is not None:
+                generation_kwargs["top_p"] = top_p
+
+        output = self.model.vlm.generate(**generation_kwargs)
+        if int(output.sequences.shape[0]) != batch_size:
+            raise RuntimeError(
+                "VLM generation returned an unexpected batch size: "
+                f"expected {batch_size}, got {int(output.sequences.shape[0])}"
+            )
+
+        if isinstance(eos_token_id, int):
+            eos_token_ids = {eos_token_id}
+        else:
+            eos_token_ids = set(eos_token_id or [])
+
+        results = []
+        for batch_index in range(batch_size):
+            generated_ids = output.sequences[batch_index, prompt_width:]
+            token_ids = [int(token_id) for token_id in generated_ids.detach().cpu()]
+
+            finish_reason: Literal["stop", "length"] = (
+                "length" if len(token_ids) == max_new_tokens else "stop"
+            )
+            stop_position = next(
+                (
+                    index + 1
+                    for index, token_id in enumerate(token_ids)
+                    if token_id in eos_token_ids
+                ),
+                None,
+            )
+            if stop_position is not None:
+                token_ids = token_ids[:stop_position]
+                finish_reason = "stop"
+            elif pad_token_id is not None and pad_token_id in token_ids:
+                token_ids = token_ids[: token_ids.index(pad_token_id)]
+                finish_reason = "stop"
+
+            results.append(
+                DM05TextGenerationOutput(
+                    token_ids=token_ids,
+                    prompt_tokens=prompt_token_counts[batch_index],
+                    finish_reason=finish_reason,
+                )
+            )
+        return results
+
+    @torch.no_grad()
+    def generate_text(
+        self,
+        *,
+        input_ids: torch.LongTensor,
+        attention_mask: torch.Tensor | None = None,
+        pixel_values: torch.Tensor | None = None,
+        token_type_ids: torch.LongTensor | None = None,
+        max_new_tokens: int = 1024,
+        do_sample: bool = False,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        stop_strings: list[str] | None = None,
+        tokenizer=None,
+        eos_token_id: int | list[int] | None = None,
+        pad_token_id: int | None = None,
+    ) -> DM05TextGenerationOutput:
+        """Generate a text response with the underlying Gemma3 VLM."""
+        return self.generate_text_batch(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            pixel_values=pixel_values,
+            token_type_ids=token_type_ids,
+            max_new_tokens=max_new_tokens,
+            do_sample=do_sample,
+            temperature=temperature,
+            top_p=top_p,
+            stop_strings=stop_strings,
+            tokenizer=tokenizer,
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+        )[0]
 
     def _compute_prefix_cache(
         self,

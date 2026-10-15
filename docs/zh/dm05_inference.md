@@ -417,6 +417,157 @@ bash tests/curl_demo.sh http://127.0.0.1:7891/v1/infer Aloha
 bash tests/curl_history.sh http://127.0.0.1:7891/v1/infer
 ```
 
+### VLM Chat Completions 接口
+
+`POST /v1/chat/completions` 为多模态 VLM 评测实现了 OpenAI Chat Completions
+响应 schema。与 `/v1/infer` 不同，该接口返回文本，不需要机器人 state，支持任意数量的
+图片与文本交错输入，也不会添加动作推理使用的 `Robot:`、`Control mode:`、
+`Overall speed:`、`Task:` 或 `States:` 前缀。两个接口复用同一个已加载的 checkpoint
+和 processor。
+
+请求可以使用纯字符串 content，也可以使用 OpenAI 风格的 content parts：
+
+```bash
+curl -X POST http://127.0.0.1:7891/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  --data @- <<'EOF'
+{
+  "model": "dm05",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {"type": "text", "text": "Describe this image."},
+        {
+          "type": "image_url",
+          "image_url": {"url": "data:image/png;base64,<base64-image>"}
+        }
+      ]
+    }
+  ],
+  "max_tokens": 128,
+  "temperature": 0
+}
+EOF
+```
+
+图片必须是 data URL 或裸 base64 字符串。接口拒绝外部 HTTP(S) 图片 URL，也不支持
+video/audio part。`max_tokens` 和 `max_completion_tokens` 都可使用，默认值为 1024。
+`temperature` 省略或为 0 时使用 greedy decoding；大于 0 时启用采样。`stop` 可以是
+字符串或字符串数组。为了兼容 lmms-eval，未知顶层字段会被忽略；但服务不实现 SSE，
+所以 `stream: true` 会被拒绝。
+
+成功响应遵循 OpenAI schema：
+
+```json
+{
+  "id": "chatcmpl-1a2b3c4d",
+  "object": "chat.completion",
+  "created": 1785000000,
+  "model": "dm05",
+  "choices": [
+    {
+      "index": 0,
+      "message": {"role": "assistant", "content": "A robot workcell..."},
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 812,
+    "completion_tokens": 37,
+    "total_tokens": 849
+  },
+  "metadata": {"latency_ms": 1234.5}
+}
+```
+
+VLM chat 配置：
+
+- `--inference-config.enable-vlm-chat`：是否启用该接口，默认 `true`。
+- `--inference-config.chat-max-new-tokens`：服务端输出上限，默认 2048。请求值超过
+  上限时会被 clamp，并记录 warning。
+- `--inference-config.chat-max-input-tokens`：tokenize 后的最大 prompt 长度，默认 8192；
+  超过限制时返回 HTTP 400。
+
+使用 `--inference-config.backend fast` 时，动作推理仍走 fast runtime，但 chat 生成会
+特意走标准 PyTorch VLM 路径。如果该配置下 chat 生成失败，请改用
+`--inference-config.backend default`。
+
+通过 lmms-eval 的 OpenAI backend 跑图片 benchmark：
+
+```bash
+OPENAI_API_KEY=EMPTY python3 -m lmms_eval \
+  --model openai \
+  --model_args model=dm05,base_url=http://127.0.0.1:7891/v1,api_key=EMPTY,num_concurrent=1 \
+  --tasks mme \
+  --batch_size 1 \
+  --log_samples \
+  --output_path ./lmms_results/dm05
+```
+
+该服务推荐使用 `num_concurrent=1` 到 `4`。对于 `max_tokens` 上千的长输出任务，务必
+使用 `num_concurrent=1`：Flask 以 `threaded=False` 单线程串行处理请求。lmms-eval
+默认的 32 路并发会让队尾请求撞到 OpenAI SDK 默认的 600 秒超时，随后产生的重试还会
+进一步倒灌并压满队列。
+
+#### GPU 人工验收
+
+在有 GPU 且已准备 LIBERO checkpoint 的机器上启动 default backend：
+
+```bash
+script/dm05_launcher.sh \
+  --exp playground/dm05_libero.py \
+  --task inference \
+  --model-config.model-name-or-path ./checkpoints/DM05-libero \
+  --model-config.chunk-size 10 \
+  --inference-config.backend default \
+  --inference-config.output-action-dim 7 \
+  --inference-config.image-prompts "Head" "Left wrist" \
+  --inference-config.port 7891
+```
+
+在另一个 shell 中运行：
+
+```bash
+bash tests/curl_chat.sh
+```
+
+预期得到一个 JSON 对象：`object` 为 `"chat.completion"`，assistant `content` 非空，
+`finish_reason` 为 `"stop"` 或 `"length"`，并且 `usage` 的三个字段都是整数。然后用
+下面的代码确认 openai-python 能接受响应并通过 pydantic 校验：
+
+```python
+import base64
+from pathlib import Path
+
+from openai import OpenAI
+
+image = base64.b64encode(
+    Path("assets/demo/images/episode0/cam_high/0.jpg").read_bytes()
+).decode("ascii")
+client = OpenAI(base_url="http://127.0.0.1:7891/v1", api_key="EMPTY")
+completion = client.chat.completions.create(
+    model="dm05",
+    messages=[
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Describe the scene."},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{image}"},
+                },
+            ],
+        }
+    ],
+    max_tokens=128,
+    temperature=0,
+)
+print(type(completion).__name__)  # ChatCompletion
+print(completion.choices[0].message.content)
+print(completion.usage)
+```
+
 ### Legacy `/process_frame` 接口
 
 兼容接口接收 `multipart/form-data`，并通过重复的 `image` 文件字段上传图片。
