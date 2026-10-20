@@ -195,11 +195,3 @@ LoRA adapter 请先合并导出，再构建 engines。
 启动日志应显示 `Enabled FP8 prefix MLP` 和实际捕获的 bucket。测速需在同卡上固定
 输入、mask、初始 noise、bucket、chunk 和去噪步数，分别报告模型、服务和客户端耗时。
 宣称成功率保持之前，需完成对应任务评测。
-
-可选 GPU 测试会实际构建小型 engine，对照 PyTorch FP8 Q/DQ 参考实现，并验证多个
-bucket 切换和输入变化：
-
-```bash
-OPENDM_TEST_FP8_CUDA=1 python -m pytest -q tests/test_prefix_mlp_fp8_cuda.py
-python -m unittest discover -s tests -p test_prefix_mlp_fp8_contract.py
-```

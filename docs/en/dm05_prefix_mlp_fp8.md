@@ -230,11 +230,3 @@ Benchmark BF16 and FP8 on the same GPU with identical inputs, masks, initial
 noise, bucket, chunk size and denoising steps. Keep model latency, service latency
 and client latency separate. Run the task evaluator before claiming maintained
 success rate.
-
-The optional integration test builds a small real engine and checks FP8 Q/DQ
-against a PyTorch reference, then changes inputs and replays multiple buckets:
-
-```bash
-OPENDM_TEST_FP8_CUDA=1 python -m pytest -q tests/test_prefix_mlp_fp8_cuda.py
-python -m unittest discover -s tests -p test_prefix_mlp_fp8_contract.py
-```
