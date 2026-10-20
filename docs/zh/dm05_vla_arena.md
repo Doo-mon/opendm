@@ -132,105 +132,180 @@ script/dm05_launcher.sh \
 
 ### 准备阶段
 
-1. 按照上述步骤启动 DM05 推理服务并保持运行。
-2. 克隆 VLA-Arena 官方代码库：
+1. 建议使用至少 2 张 GPU 完成评测流程：一张 GPU 运行 OpenDM 推理服务，另一张 GPU 运行 VLA-Arena 仿真和 EGL 渲染。
+2. 按照上述步骤启动 DM05 推理服务并保持运行。dexbotic-benchmark 会通过 HTTP 请求该服务，配置中使用 `base_url`，例如 `http://<SERVER_IP>:7891`，不要附加 `/process_frame`。
+3. 配置 benchmark 环境。VLA-Arena 评测使用 `dexbotic-benchmark` 中的 Arena runner，不再需要把 OpenDM 的评测文件复制到 VLA-Arena 官方仓库。
 
 ```bash
-git clone https://github.com/PKU-Alignment/VLA-Arena
-cd VLA-Arena
+# 获取评测脚本和配置文件。
+git clone https://github.com/dexmal/dexbotic-benchmark.git
+cd dexbotic-benchmark
+
+# 只评测 VLA-Arena 时，仅初始化 Arena 子模块即可。
+git submodule update --init --recursive arena
 ```
 
-3. 安装 VLA-Arena 依赖：
+4. 创建本地 VLA-Arena 评测环境。Arena 评测当前推荐使用本地 Conda 环境运行；如需更完整的系统依赖说明，可参考 `dexbotic-benchmark/docs/local_install.md` 中的 VLA-Arena Environment 部分。
 
 ```bash
-sudo apt-get install -y libosmesa6-dev libglfw3 libgl1-mesa-glx libglib2.0-0
+sudo apt-get update
+sudo apt-get install -y \
+  build-essential cmake pkg-config ffmpeg \
+  libegl1 libegl1-mesa libegl1-mesa-dev libgl1 libglvnd-dev \
+  libosmesa6-dev libsm6 libxext6 libxrender-dev
 
-pip install robosuite==1.5.1 bddl numpy==1.26.4 requests tqdm pyyaml "imageio[ffmpeg]" pillow
+conda create -n arena python=3.11 pip -y
+conda activate arena
+python -m pip install --upgrade pip setuptools wheel
 
-pip install -e .
+python -m pip install torch==2.1.0 \
+  --index-url https://download.pytorch.org/whl/cu121
 
-export MUJOCO_GL=osmesa
-```
+python -m pip install -e arena
+python -m pip install \
+  numpy==1.26.4 opencv-python-headless==4.11.0.86 mujoco==3.10.0 \
+  omegaconf requests tqdm Pillow PyYAML imageio-ffmpeg
 
-4. 将 OpenDM 提供的 DM05 评测文件复制到 VLA-Arena 代码库中：
-
-```bash
-# 在 VLA-Arena 仓库根目录运行。
-mkdir -p vla_arena/models/DM05
-
-# 从 OpenDM tools 目录复制
-cp <opendm路径>/third_party/vla_arena/eval.py vla_arena/models/DM05/eval.py
-cp <opendm路径>/third_party/vla_arena/eval_config.yaml vla_arena/models/DM05/eval_config.yaml
+conda env config vars set -n arena \
+  MUJOCO_GL=egl \
+  PYOPENGL_PLATFORM=egl \
+  EGL_PLATFORM=device
+conda deactivate
+conda activate arena
 ```
 
 ### 评测阶段
 
 #### 修改评测配置
 
-打开 `vla_arena/models/DM05/eval_config.yaml`，将 `server_url` 修改为已启动的推理服务地址：
+使用并修改 VLA-Arena 示例配置 `evaluation/configs/arena/example_arena.yaml`：
 
 ```yaml
-# ----- HTTP inference server -----
-server_url: "http://<SERVER_IP>:7891/process_frame"
-request_timeout: 30          # 秒
-
-# ----- Model inference parameters -----
-action_horizon: 20
-replan_steps: 10
-robot_type: "Franka"
-batch_size: 1
-speed: "0.5"
-
-# ----- Task selection -----
-# "all" 评测全部 170 个任务（11 个 suite × 3 个 level）
-task_suite_name: "all"
-task_level: 0
-
-# ----- Episode settings -----
+# 任务选择。all 会评测非 LIBERO 的 11 个 Arena suite。
+task_suite_name: all
+task_level: all
+parallelized: false
 num_trials_per_task: 10
+num_steps_wait: 10
 seeds: [7, 42, 1000]
 
-# ----- Output -----
-model_name: "DM05"
-local_log_dir: "./experiments/eval_results"
-save_video_mode: "first_success_failure"
+# 仿真环境与鲁棒性开关。
+env_img_res: 256
+apply_mujoco3_patch: true
+add_noise: false
+adjust_light: false
+randomize_color: false
+camera_offset: false
+safety: false
+use_pruned_init: false
+init_state_selection_mode: first
+init_state_offset: 0
+init_state_offset_random: false
+rotate_images_180: false
+
+# OpenDM 推理服务。
+base_url: http://localhost:7891
+api_style: legacy
+replan_step: 10
+send_state: true
+send_image:
+  - image
+  - wrist_image
+discrete_gripper: false
+discrete_action_dims: [0, 1, 2, 6]
+discrete_action_threshold: 0.5
+clip_actions: false
+use_text_template: false
+
+# legacy multipart 请求参数。
+batch_size: 1
+speed: "0.5"
+action_horizon: 20
+request_timeout: 30
+
+# 指令鲁棒性。
+replacements_file: VLA-Arena/language_replacements
+use_replacements: false
+replacement_probability: 1.0
+replacement_level: 1
+
+# 输出。
+save_video_mode: first_success_failure
+video_fps: 30
+result_json_path: default
+output_dir: experiments/eval_results
+log_level: INFO
 ```
 
 可修改的配置内容包括：
 
-- `server_url`：已启动的 DM05 推理服务地址，通常为 `http://<SERVER_IP>:7891/process_frame`。
-- `task_suite_name`：评测的任务集。设为 `"all"` 评测全部 170 个任务，也可以指定具体 suite 名称，如 `"safety_static_obstacles"`。
-- `task_level`：评测的任务难度级别，仅在 `task_suite_name` 不为 `"all"` 时生效。
-- `seeds`：随机种子列表，每个种子会完整跑一轮评测。
+- `base_url`：已启动的 DM05 推理服务地址，通常为 `http://<SERVER_IP>:7891`。dexbotic-benchmark 会根据 `api_style: legacy` 自动请求 `/process_frame`。
+- `api_style`：OpenDM VLA-Arena 服务使用 legacy multipart 接口时保持 `legacy`。
+- `task_suite_name`：评测任务集。设为 `all` 评测全部 Arena suite，也可以指定具体 suite 名称，如 `safety_static_obstacles`、`extrapolation_unseen_objects`。
+- `task_level`：评测难度级别，可选 `0`、`1`、`2` 或 `all`。
+- `parallelized`：设为 `true` 时会为 L0、L1、L2 各启动一个评测进程；此时 `task_level` 必须为 `all`，并且推理服务需要能承载 3 路并发请求。
+- `seeds`：随机种子列表。命令行覆盖时使用逗号分隔，例如 `--set seeds 7,42,1000`。
 - `num_trials_per_task`：每个任务评测的 episode 数量。
-- `local_log_dir`：评测结果保存目录。
+- `replan_step`：每次调用模型后执行的动作步数，默认执行 10 步后重新请求模型。
+- `action_horizon`：服务每次返回的动作块长度，需要与推理服务 `--model-config.chunk-size` 保持一致。
+- `use_replacements`：是否启用 VLA-Arena 的 instruction replacement 鲁棒性测试；默认 `false`，与参考配置一致。
+- `save_video_mode`：视频保存模式，可选 `all`、`first_success_failure`、`none`。
+- `output_dir`：评测结果保存目录。
 
 #### 启动 VLA-Arena 评测
 
-在 VLA-Arena 仓库根目录下执行：
+在 `dexbotic-benchmark` 仓库根目录下执行：
 
 ```bash
-# 在 VLA-Arena 仓库根目录运行。
-cd VLA-Arena
+cd dexbotic-benchmark
+conda activate arena
 
-python -m vla_arena.models.DM05.eval \
-  --config vla_arena/models/DM05/eval_config.yaml \
-  --output-dir ./experiments/eval_results
+python3 evaluation/run_arena_evaluation.py \
+  --config evaluation/configs/arena/example_arena.yaml \
+  --set base_url http://<SERVER_IP>:7891 \
+  --set output_dir experiments/eval_results
 ```
 
-如需只评测指定任务列表而非全部任务，可通过 `--task-list-file` 传入任务列表文件：
+建议先跑小规模 sanity check，确认服务请求、图像顺序、动作维度和仿真渲染都正常：
 
 ```bash
-python -m vla_arena.models.DM05.eval \
-  --config vla_arena/models/DM05/eval_config.yaml \
-  --task-list-file <任务列表文件路径> \
-  --output-dir ./experiments/eval_results
+python3 evaluation/run_arena_evaluation.py \
+  --config evaluation/configs/arena/example_arena.yaml \
+  --set task_suite_name safety_static_obstacles \
+  --set task_level 0 \
+  --set num_trials_per_task 1 \
+  --set seeds 7 \
+  --set base_url http://<SERVER_IP>:7891 \
+  --set output_dir results/arena_smoke
 ```
+
+如需并发评测 L0、L1、L2，可以开启 parallelized：
+
+```bash
+python3 evaluation/run_arena_evaluation.py \
+  --config evaluation/configs/arena/example_arena.yaml \
+  --set task_level all \
+  --set parallelized true \
+  --set base_url http://<SERVER_IP>:7891 \
+  --set output_dir experiments/eval_results_parallel
+```
+
+并发模式会共享同一个推理服务。如果服务端使用全局随机采样、默认 session 记忆或无法承载并发请求，结果可能与串行评测不完全一致；需要严格复现轨迹时使用默认串行模式。
 
 #### 确认评测结果
 
-评测结果保存在 `<output-dir>/seed_<N>/` 目录下，主要文件：
+评测结果保存在 `output_dir` 下，主要文件：
 
-- `results_<timestamp>.json`：各任务及汇总的成功率和 cost。
-- `tasks_<timestamp>.csv`：各任务结果的 CSV 格式汇总。
-- `videos/<suite>/<task_id>_<episode>_<success|failure>.mp4`：rollout 视频。
+- `results.json`：当前 run 的详细结果和汇总结果。
+- `leaderboard.json`：VLA-Arena leaderboard 格式结果。
+- `config.yaml`：实际生效的评测配置。
+- `logs/evaluation.log`：评测日志。
+- `videos/`：按 `save_video_mode` 保存的 rollout 视频。
+- `seed_<N>/`：多 seed 评测时，每个 seed 的独立结果目录。
+- `batch_summary_<timestamp>.json`：多 seed 评测时生成的 SR/CC 聚合统计。
+- `parallel_levels/`：并发评测时，每个 level worker 的中间输出。
+
+使用默认 `seeds` 配置时，各 seed 的 `leaderboard.json` 和 `videos/` 位于
+`seed_<N>/` 下；顶层 `results.json` 汇总各 seed 的结果。
+
+评测结束后，优先查看 `results.json` 和 `batch_summary_<timestamp>.json`。Safety suite 的 CC 对应 cumulative cost。
