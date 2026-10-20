@@ -8,6 +8,7 @@ used during fast inference.
 
 from __future__ import annotations
 
+import hashlib
 import shlex
 import subprocess
 import sys
@@ -211,14 +212,21 @@ def deserialize_engine(
     trt: Any,
     engine_path: str | Path,
     context: str,
+    *,
+    artifact_record: dict | None = None,
 ) -> tuple[Any, Any]:
     engine_path = Path(engine_path)
     logger = trt.Logger(trt.Logger.WARNING)
+    payload = engine_path.read_bytes()
     with trt.Runtime(logger) as runtime:
-        engine = runtime.deserialize_cuda_engine(engine_path.read_bytes())
+        engine = runtime.deserialize_cuda_engine(payload)
     if engine is None:
         raise RuntimeError(
             f"Failed to deserialize {context} TensorRT engine: {engine_path}"
+        )
+    if artifact_record is not None:
+        artifact_record.update(
+            bytes=len(payload), sha256=hashlib.sha256(payload).hexdigest()
         )
     return logger, engine
 
@@ -474,10 +482,12 @@ class _TensorRTRunnerBase:
             )
         self.device = resolve_cuda_device(device, runtime_context)
         self.trt = load_tensorrt(runtime_context)
+        self.engine_identity = {}
         self.logger, self.engine = deserialize_engine(
             self.trt,
             self.engine_path,
             engine_context,
+            artifact_record=self.engine_identity,
         )
         self.device_memory_size = device_memory_size(self.engine)
         self.uses_external_device_memory = bool(

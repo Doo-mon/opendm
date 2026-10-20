@@ -5,6 +5,9 @@
 
 [English](../en/dm05_inference.md)
 
+可选的 TensorRT Prefix MLP FP8 后端参见
+[校准、engine 构建与部署指南](dm05_prefix_mlp_fp8.md)。
+
 ## 1. 使用前准备
 
 所有命令都在 OpenDM 仓库根目录运行。请准备：
@@ -278,8 +281,28 @@ pip install -e ".[fast-infer]"
 不会自动回退：TensorRT 用于准备 vision engine，Triton 是 prefix/suffix fast kernels 的
 硬依赖，而 PyTorch 中也必须提供 `flex_attention`。
 
-在对应的 default backend 命令中加入 `--inference-config.backend fast`。如果不传
-`--inference-config.vision-trt-engine-path`，默认 engine 路径是
+若需要可选的 prefix MLP FP8 优化，先离线同时准备 **vision FP16 engine 和 prefix MLP
+FP8 engines**：
+
+```bash
+python -m opendm.infer.prepare_fast \
+  --checkpoint ./checkpoints/DM05-libero \
+  --playground libero \
+  --prefix-mlp-precision fp8 \
+  --requests-jsonl ./calibration_requests.jsonl \
+  --samples 128
+```
+
+精度参数只控制 MLP。Vision 保持 FP16，无需 FP8 校准；MLP 校准使用刚构建的 vision
+engine 和真实部署输入。该命令只准备产物，不启动服务，当前必须显式传入
+`--prefix-mlp-precision fp8`，尚不提供仅 BF16 的准备模式。普通 BF16 fast 推理无需执行
+这一步。旧命令 `prepare_fast_fp8` 保留为默认选择 FP8 的兼容入口。
+校准数据、自定义输出目录和当前 1024 token 限制，见
+[一键准备指南](dm05_prefix_mlp_fp8.md#一键准备)。
+
+在对应的 default backend 命令中加入 `--inference-config.backend fast`。未指定 vision/FP8
+路径和外部 prepared 目录时，启动流程会优先选择 checkpoint 下兼容的 prepared FP8
+generation；没有选中时，公共 BF16 fast 路径才使用默认 vision engine
 `checkpoints/trt_engines/dm05_vision.engine`。LIBERO 完整示例：
 
 ```bash
@@ -294,13 +317,13 @@ script/dm05_launcher.sh \
   --inference-config.port 7891
 ```
 
-如果 engine 不存在，launcher 不会立刻对外提供服务，而是会先导出 ONNX、构建
-TensorRT engine，再继续完成配置好的 CUDA Graph profiles capture，最后 HTTP 服务才会
-就绪。每个 checkpoint 和图片布局应使用独立的 engine 路径。现有 engine 目前只按图片
+在 BF16 fast 路径中，如果 vision engine 不存在，launcher 不会立刻对外提供服务，而是会先
+导出 ONNX、构建 TensorRT engine，再完成配置好的 CUDA Graph profiles capture，最后
+HTTP 服务才会就绪。每个 checkpoint 和图片布局应使用独立的 engine 路径。现有 engine 目前只按图片
 数量决定是否复用，因此更换 checkpoint 时必须换新路径，或者传
 `--inference-config.force-rebuild`。
 
-手动构建 engine：
+为 BF16 fast 路径手动构建 vision FP16 engine：
 
 ```bash
 python -m opendm.infer.build_vision_trt \
@@ -330,7 +353,8 @@ python -m opendm.infer.build_vision_trt \
   默认 buckets 为 `896 1024 2048 4096`。
 - 自定义 bucket 列表必须非空、严格递增，并且不能超过 `fast_prefix_len`。
 - Bucket 越多，服务启动时间和显存占用越高。
-- 请求超过最大自定义 bucket、但仍不超过 `fast_prefix_len` 时，会使用更慢的 eager fallback。
+- BF16 fast 路径中，请求超过最大自定义 bucket、但仍不超过 `fast_prefix_len` 时，会使用
+  更慢的 eager fallback。Prepared 或显式 FP8 要求请求落入已配置 bucket，超出时直接拒绝。
 
 只有 workload 需要不同 prefix shape 时才覆盖默认值：
 
@@ -624,9 +648,11 @@ Legacy 成功响应保持历史格式：
 | `--inference-config.fast-prefix-len` | Fast backend 的 prefix token 容量。父类默认 `1024`；MEM demo 和 `cover_blocks` 为 `2048`；RoboColiseum manipulation 为 `4096`。 |
 | `--data-config.is-history` | 开启后才接受 `history_images`；普通 `curl_demo.sh` 不需要。 |
 | `--inference-config.backend` | `default` 或 `fast`。 |
-| `--inference-config.vision-trt-engine-path` | 当前 checkpoint 专用的 TensorRT vision engine 路径；默认值为 `checkpoints/trt_engines/dm05_vision.engine`。 |
+| `--inference-config.vision-trt-engine-path` | 显式指定当前 checkpoint 专用的 TensorRT vision engine，并跳过 prepared 自动选择；BF16 fallback 默认路径为 `checkpoints/trt_engines/dm05_vision.engine`。 |
 | `--inference-config.force-rebuild` | Fast 推理前重新构建 vision engine。 |
 | `--inference-config.prefix-seq-len-buckets` | 可选的非空 fast-backend 自定义 buckets，每个值必须 `<= fast_prefix_len`。 |
+| `--inference-config.no-auto-prepared-fast-artifacts` | 关闭默认启用的 checkpoint 内兼容离线 FP8 generation 自动选择。 |
+| `--inference-config.prepared-fast-artifacts-dir` | `prepare_fast --prefix-mlp-precision fp8`（旧入口：`prepare_fast_fp8`）生成的外部 prepared generation 根目录，包含 vision FP16 和 prefix MLP FP8 engines。 |
 | `--inference-config.port` | HTTP 服务端口，默认值为 `7891`。 |
 
 ## 7. 常见问题
@@ -639,8 +665,9 @@ Legacy 成功响应保持历史格式：
 | Fast 启动阶段出现 import 错误 | 在当前环境重新执行 `pip install -e ".[fast-infer]"`，并检查 `import tensorrt`、`import triton`、`import torch.nn.attention.flex_attention` 是否成功。 |
 | TensorRT 图片数量不匹配 | 用与 `image_prompts` 数量相同的 `--num-images` 重建；开启 history 时用 `len(image_prompts) + max_history_images`。 |
 | 更换 checkpoint 后复用同一 engine 导致结果异常 | 使用 checkpoint 专用 engine 路径，或者传 `--inference-config.force-rebuild`。 |
+| 预期使用 BF16，但启动时启用了 prepared FP8 | 传 `--inference-config.no-auto-prepared-fast-artifacts`；显式 engine 路径仍有更高优先级。 |
 | Prefix buckets 为空、乱序或过大 | 传入非空递增列表，且所有值不超过 `fast_prefix_len`。 |
-| Fast prefix 超过 `fast_prefix_len` | 缩短 instruction，或提高 `--inference-config.fast-prefix-len` 及对应 buckets（MEM / `cover_blocks`：`2048`）。 |
+| Fast prefix 超过最大 bucket | BF16 在 `fast_prefix_len` 内可走 eager；FP8 会拒绝，应使用覆盖该请求的 prepared profile 或关闭 FP8 自动选择。 |
 | Default backend 偶尔有单次请求较慢 | 新执行 profile 第一次走 eager，第二次出现时 capture；后续匹配请求会复用 Graph。 |
 | Fast 服务长时间未就绪 | 等待 engine 准备和所有 CUDA Graph profiles 在启动阶段完成 capture。 |
 

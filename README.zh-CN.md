@@ -265,8 +265,9 @@ python -c "import torch.nn.attention.flex_attention"
 ```
 
 请使用提供 `torch.nn.attention.flex_attention` 的 PyTorch 版本，例如 `torch>=2.5`。
-同时要预留首次 fast 启动时间：每个 checkpoint / image layout 第一次启动时，服务会先
-导出 ONNX 并构建 TensorRT engine，之后 HTTP 服务才会就绪。
+没有可复用的 vision engine 时，每个 checkpoint / image layout 首次 fast 启动会先
+导出 ONNX 并构建 TensorRT engine。下文的离线准备可以提前提供这个 engine；服务启动时
+仍需完成配置好的 CUDA Graph profiles capture，之后 HTTP 服务才会就绪。
 
 ## 推理
 
@@ -288,6 +289,36 @@ script/dm05_launcher.sh \
 [DM05 推理指南](docs/zh/dm05_inference.md)。
 新的接入方优先使用 `/v1/infer`。旧的 `/process_frame` multipart 接口仍作为 legacy 兼容路径保留，但会逐步被替换。
 通用 VLM benchmark 可以使用兼容 OpenAI 的 [`/v1/chat/completions` 多模态对话接口](docs/zh/dm05_inference.md#vlm-chat-completions-接口)。
+
+### 一键准备 Fast 产物：Prefix MLP 使用 FP8
+
+安装 fast 依赖后，可用下面的离线命令同时准备 **vision FP16 engine 和 prefix MLP
+FP8 engines**。以 LIBERO 为例：
+
+```bash
+python -m opendm.infer.prepare_fast \
+  --checkpoint ./checkpoints/DM05-libero \
+  --playground libero \
+  --prefix-mlp-precision fp8 \
+  --requests-jsonl ./calibration_requests.jsonl \
+  --samples 128
+```
+
+精度参数只作用于 prefix MLP，vision 仍使用 FP16。命令会先构建 vision engine，再用它
+和真实部署输入校准 MLP，最后构建 MLP FP8 engines；这一步不会启动推理服务。
+产物默认写入 `<checkpoint>/.opendm/fast_fp8`。随后启动服务：
+
+```bash
+python playground/dm05_libero.py --task inference \
+  --model-config.model-name-or-path ./checkpoints/DM05-libero \
+  --inference-config.backend fast
+```
+
+Fast 会自动复用兼容的 prepared 产物。准备工具当前必须显式传入
+`--prefix-mlp-precision fp8`，尚不提供仅 BF16 的准备模式；普通 BF16 fast 推理无需执行
+这项校准。旧命令 `prepare_fast_fp8` 保留为默认选择 FP8 的兼容入口。
+校准数据格式、直接使用数据集、RoboTwin2 和当前 1024 token 限制，见
+[一键准备与校准指南](docs/zh/dm05_prefix_mlp_fp8.md#一键准备)。
 
 ## 训练
 

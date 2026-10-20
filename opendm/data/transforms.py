@@ -689,6 +689,8 @@ class ChatTokenization:
         enable_logging: Whether to log the decoded tokenized prompt.
         prompt_is_formatted: Whether the prompt already contains task/subtask
             labels and punctuation.
+        reject_prompt_truncation: Whether to reject prompts that deployment
+            would otherwise shorten to fit ``max_length``.
     """
 
     def __init__(
@@ -702,6 +704,7 @@ class ChatTokenization:
         max_history_images: int = 32,
         enable_logging: bool = False,
         prompt_is_formatted: bool = False,
+        reject_prompt_truncation: bool = False,
     ):
         self.processor = processor
         self.tokenizer = (
@@ -715,6 +718,7 @@ class ChatTokenization:
         self.max_history_images = max_history_images
         self.enable_logging = enable_logging
         self.prompt_is_formatted = prompt_is_formatted
+        self.reject_prompt_truncation = reject_prompt_truncation
         self.history_placeholder_token_id = self.tokenizer.convert_tokens_to_ids(
             "<unused0>"
         )
@@ -825,6 +829,12 @@ class ChatTokenization:
             )
             logger.info(f"Decoded input_ids: {decode_text_collapsed}")
         if inputs["input_ids"].shape[1] > self.max_length:
+            if self.reject_prompt_truncation:
+                raise ValueError(
+                    "The deployment tokenizer would shorten this prompt to fit "
+                    f"max_length={self.max_length}; choose representative inputs "
+                    "that fit the configured fast prefix instead."
+                )
             prompt_for_truncation = data["prompt"]
             prompt_token_ids = self.tokenizer.encode(
                 prompt_for_truncation,

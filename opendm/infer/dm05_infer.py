@@ -208,6 +208,7 @@ class DM05FastInferRuntime:
         is_history: bool = False,
         max_history_images: int = MAX_HISTORY_IMAGES,
         prefix_len: int = 1024,
+        prefix_mlp_fp8_engine_dir: str | Path | None = None,
     ) -> None:
         self.model = DM05FastForCausalLM(model, prefix_len=int(prefix_len))
         self.device = next(model.parameters()).device
@@ -262,6 +263,29 @@ class DM05FastInferRuntime:
             prefix_capacity=self.prefix_len,
             minimum_prefix_len=minimum_prefix_len,
         )
+        self.prefix_mlp_fp8_backend = None
+        self._fp8_completion = None
+        if prefix_mlp_fp8_engine_dir is not None:
+            if self.is_history or self.noise_dtype != torch.bfloat16:
+                raise ValueError(
+                    "FP8 prefix MLP requires the BF16 static fast backend without history."
+                )
+            from opendm.infer.dm05_prefix_mlp_trt import PrefixMLPFP8Backend
+
+            self.prefix_mlp_fp8_backend = PrefixMLPFP8Backend(
+                self.dm05.vlm,
+                prefix_mlp_fp8_engine_dir,
+                self.prefix_seq_len_buckets,
+                device=self.device,
+                vision_engine_identity=self.vision_trt_runner.engine_identity,
+            )
+            self._fp8_completion = torch.cuda.Event()
+            logger.info(
+                "Enabled FP8 prefix MLP: {} layers, buckets {}, bundle {}",
+                self.prefix_mlp_fp8_backend.layer_count,
+                self.prefix_seq_len_buckets,
+                prefix_mlp_fp8_engine_dir,
+            )
         with self._precision_context():
             self._initialize_graph_profiles()
 
@@ -476,6 +500,11 @@ class DM05FastInferRuntime:
             token_type_ids=profile.token_type_ids,
             prefix_cache=profile.prefix_cache,
             prefix_buffers=profile.prefix_buffers,
+            prefix_mlp_forward=(
+                self.prefix_mlp_fp8_backend.forward_into
+                if self.prefix_mlp_fp8_backend is not None
+                else None
+            ),
         )
         prefix_visible_mask = self.model.build_prefix_visible_mask(
             input_ids=profile.input_ids,
@@ -541,17 +570,28 @@ class DM05FastInferRuntime:
         history_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         with self._inference_lock:
-            return self._forward_locked(
-                images=images,
-                input_ids=input_ids,
-                diffusion_input_noise=diffusion_input_noise,
-                attention_mask=attention_mask,
-                token_type_ids=token_type_ids,
-                diffusion_steps=diffusion_steps,
-                action_mask=action_mask,
-                history_pixel_values=history_pixel_values,
-                history_mask=history_mask,
-            )
+            stream = None
+            if self._fp8_completion is not None:
+                stream = torch.cuda.current_stream(self.device)
+                stream.wait_event(self._fp8_completion)
+            try:
+                result = self._forward_locked(
+                    images=images,
+                    input_ids=input_ids,
+                    diffusion_input_noise=diffusion_input_noise,
+                    attention_mask=attention_mask,
+                    token_type_ids=token_type_ids,
+                    diffusion_steps=diffusion_steps,
+                    action_mask=action_mask,
+                    history_pixel_values=history_pixel_values,
+                    history_mask=history_mask,
+                )
+                # FP8 contexts share scratch memory across graphs. Finish the
+                # caller-owned copy before another stream may reuse that memory.
+                return result.clone() if stream is not None else result
+            finally:
+                if stream is not None:
+                    self._fp8_completion.record(stream)
 
     def _forward_locked(
         self,
@@ -603,6 +643,8 @@ class DM05FastInferRuntime:
             and bool(history_mask.any().item())
         )
         if has_history_pixels:
+            if self.prefix_mlp_fp8_backend is not None:
+                raise ValueError("FP8 prefix MLP does not support history requests.")
             if int(history_pixel_values.shape[0]) > self.max_history_images:
                 raise ValueError(
                     f"At most {self.max_history_images} history images are supported, "
@@ -630,6 +672,11 @@ class DM05FastInferRuntime:
                 token_type_ids=token_type_ids,
                 diffusion_input_noise=diffusion_input_noise,
                 action_mask=action_mask,
+            )
+        if self.prefix_mlp_fp8_backend is not None:
+            raise ValueError(
+                "FP8 prefix MLP request exceeds configured static buckets; "
+                "build a covering profile instead of falling back to BF16."
             )
         self.dynamic_fallback_count += 1
         if self.dynamic_fallback_count == 1:

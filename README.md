@@ -269,9 +269,10 @@ python -c "import torch.nn.attention.flex_attention"
 ```
 
 Use a PyTorch build that provides `torch.nn.attention.flex_attention` (for
-example `torch>=2.5`). Also expect the first fast launch for each
-checkpoint/image layout to spend extra time exporting ONNX and building the
-TensorRT engine before the HTTP service becomes ready.
+example `torch>=2.5`). If no reusable vision engine is available, the first fast
+launch for each checkpoint/image layout spends extra time exporting ONNX and
+building the TensorRT engine. Offline preparation below can supply that engine;
+startup still captures the configured CUDA Graph profiles before serving.
 
 ## Inference
 
@@ -295,6 +296,38 @@ HTTP request fields, fine-tuned checkpoint commands, fast backend setup,
 runtime constraints, and troubleshooting.
 Use `/v1/infer` for new integrations. The older `/process_frame` multipart API remains available as a legacy compatibility path and will be phased out over time.
 General VLM benchmarks can use the OpenAI-compatible [`/v1/chat/completions` multimodal chat API](docs/en/dm05_inference.md#vlm-chat-completions-api).
+
+### Prepare Fast Artifacts with Prefix MLP FP8
+
+After installing the fast dependencies, this optional offline command prepares
+**both the vision FP16 engine and the prefix MLP FP8 engines**. For LIBERO:
+
+```bash
+python -m opendm.infer.prepare_fast \
+  --checkpoint ./checkpoints/DM05-libero \
+  --playground libero \
+  --prefix-mlp-precision fp8 \
+  --requests-jsonl ./calibration_requests.jsonl \
+  --samples 128
+```
+
+The precision option applies only to the prefix MLP; vision remains FP16.
+The command builds the vision engine, uses it with real deployment inputs to
+calibrate the MLP, then builds the MLP FP8 engines. It does not start a service.
+Artifacts default to `<checkpoint>/.opendm/fast_fp8`. Start the service with:
+
+```bash
+python playground/dm05_libero.py --task inference \
+  --model-config.model-name-or-path ./checkpoints/DM05-libero \
+  --inference-config.backend fast
+```
+
+Fast automatically reuses compatible prepared artifacts. The preparation CLI
+currently requires `--prefix-mlp-precision fp8`; it has no BF16-only preparation
+mode. Ordinary BF16 fast inference does not require this calibration step.
+The old `prepare_fast_fp8` command remains a compatible alias with FP8 selected.
+See the [preparation and calibration guide](docs/en/dm05_prefix_mlp_fp8.md#one-command-preparation)
+for input formats, dataset inputs, RoboTwin2, and the current 1024-token limit.
 
 ## Training
 

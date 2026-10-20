@@ -6,6 +6,9 @@ inference setup.
 
 [中文](../zh/dm05_inference.md)
 
+For the opt-in TensorRT FP8 prefix MLP backend, see
+[calibration, engine building and deployment](dm05_prefix_mlp_fp8.md).
+
 ## 1. Before You Start
 
 Run all commands from the OpenDM repository root. Prepare:
@@ -306,9 +309,32 @@ does not fall back when these pieces are missing: TensorRT is used to prepare
 the vision engine, Triton is required by the fast prefix/suffix kernels, and
 `flex_attention` must be available in PyTorch.
 
+To enable the optional prefix MLP FP8 optimization, first prepare both the
+**vision FP16 engine and prefix MLP FP8 engines** offline:
+
+```bash
+python -m opendm.infer.prepare_fast \
+  --checkpoint ./checkpoints/DM05-libero \
+  --playground libero \
+  --prefix-mlp-precision fp8 \
+  --requests-jsonl ./calibration_requests.jsonl \
+  --samples 128
+```
+
+The precision option applies only to the MLP. Vision stays FP16 and needs no FP8
+calibration; MLP calibration uses the built vision engine and real deployment
+inputs. The command prepares artifacts without starting a service. It currently
+requires `--prefix-mlp-precision fp8` and has no BF16-only preparation mode.
+Ordinary BF16 fast inference does not require this step. The old
+`prepare_fast_fp8` command remains a compatible alias with FP8 selected.
+See [one-command preparation](dm05_prefix_mlp_fp8.md#one-command-preparation)
+for calibration data, custom output paths, and the current 1024-token limit.
+
 Add `--inference-config.backend fast` to the matching default backend command.
-If `--inference-config.vision-trt-engine-path` is not provided, the default
-engine path is `checkpoints/trt_engines/dm05_vision.engine`. For LIBERO:
+When neither an explicit vision/FP8 path nor an external prepared directory is
+set, startup first selects a compatible prepared FP8 generation under the
+checkpoint. If none is selected, the common BF16 fast path uses the default
+vision engine path `checkpoints/trt_engines/dm05_vision.engine`. For LIBERO:
 
 ```bash
 script/dm05_launcher.sh \
@@ -322,14 +348,14 @@ script/dm05_launcher.sh \
   --inference-config.port 7891
 ```
 
-If the engine does not exist, the launcher does not start serving immediately.
-It first exports ONNX and builds the TensorRT engine, then continues startup and
-captures the configured CUDA Graph profiles before the HTTP service becomes
+On the BF16 fast path, if the vision engine does not exist, the launcher does not
+start serving immediately. It first exports ONNX and builds the TensorRT engine,
+then captures the configured CUDA Graph profiles before the HTTP service becomes
 ready. Use a separate engine path for each checkpoint and image layout. An
 existing engine is currently reused based on its image count, so changing the
 checkpoint requires a new path or `--inference-config.force-rebuild`.
 
-To build an engine manually:
+To build a vision FP16 engine manually for the BF16 fast path:
 
 ```bash
 python -m opendm.infer.build_vision_trt \
@@ -363,8 +389,10 @@ slots (`--num-images 35`); RoboDojo `cover_blocks` uses 20 (`--num-images 23`).
 - A custom bucket list must be non-empty, strictly increasing, and no larger
   than `fast_prefix_len`.
 - More buckets increase service startup time and GPU memory use.
-- A request longer than the largest custom bucket uses a slower eager fallback,
-  provided it is still within `fast_prefix_len`.
+- On the BF16 fast path, a request longer than the largest custom bucket uses a
+  slower eager fallback when it is still within `fast_prefix_len`. Prepared or
+  explicitly configured FP8 requires every request to fit a configured bucket
+  and rejects longer requests.
 
 Override the defaults only when the workload requires different prefix shapes:
 
@@ -681,9 +709,11 @@ A successful legacy response returns the historical shape:
 | `--inference-config.fast-prefix-len` | Fast backend prefix token capacity. Parent default `1024`; MEM demo and `cover_blocks` use `2048`; RoboColiseum manipulation uses `4096`. |
 | `--data-config.is-history` | Required to accept `history_images`; plain `curl_demo.sh` does not need it. |
 | `--inference-config.backend` | `default` or `fast`. |
-| `--inference-config.vision-trt-engine-path` | Checkpoint-specific TensorRT vision engine path; default `checkpoints/trt_engines/dm05_vision.engine`. |
+| `--inference-config.vision-trt-engine-path` | Explicit checkpoint-specific TensorRT vision engine path; bypasses prepared auto-selection. The BF16 fallback default is `checkpoints/trt_engines/dm05_vision.engine`. |
 | `--inference-config.force-rebuild` | Rebuild the vision engine before fast inference. |
 | `--inference-config.prefix-seq-len-buckets` | Optional non-empty custom fast-backend buckets; each value must be `<= fast_prefix_len`. |
+| `--inference-config.no-auto-prepared-fast-artifacts` | Disable the default automatic selection of a compatible checkpoint-local offline FP8 generation. |
+| `--inference-config.prepared-fast-artifacts-dir` | External prepared generation root produced by `prepare_fast --prefix-mlp-precision fp8` (legacy alias: `prepare_fast_fp8`); includes vision FP16 and prefix MLP FP8 engines. |
 | `--inference-config.port` | HTTP service port; default `7891`. |
 
 ## 7. Troubleshooting
@@ -696,8 +726,9 @@ A successful legacy response returns the historical shape:
 | Fast backend fails during startup with import errors | In the active environment, reinstall `pip install -e ".[fast-infer]"` and verify `import tensorrt`, `import triton`, and `import torch.nn.attention.flex_attention`. |
 | TensorRT image-count mismatch | Rebuild with `--num-images` equal to `len(image_prompts)`; with history use `len(image_prompts) + max_history_images`. |
 | Results change after switching checkpoints with the same engine | Use a checkpoint-specific engine path or pass `--inference-config.force-rebuild`. |
+| Expected BF16 but startup enabled prepared FP8 | Pass `--inference-config.no-auto-prepared-fast-artifacts`; explicit engine paths still take precedence. |
 | Empty, unsorted, or oversized prefix buckets | Pass a non-empty increasing list whose values are at most `fast_prefix_len`. |
-| Fast prefix exceeds `fast_prefix_len` | Shorten the instruction, or raise `--inference-config.fast-prefix-len` and matching buckets (MEM / `cover_blocks`: `2048`). |
+| Fast prefix exceeds the largest bucket | BF16 may run it eagerly up to `fast_prefix_len`; FP8 rejects it, so use a prepared profile that covers the request or disable FP8 auto-selection. |
 | An occasional default-backend request is slower | A new execution profile runs eagerly once and captures on its second occurrence; later matching requests reuse the Graph. |
 | Fast service takes time to become ready | Wait for engine preparation and all configured CUDA Graph profiles to finish at startup. |
 

@@ -579,6 +579,9 @@ class DM05InferenceConfig(Config):
     use_transformed_state: bool = field(default=False)
     state_layout: str = field(default="identity")
     denorm_state: bool = field(default=False)
+    prefix_mlp_fp8_engine_dir: str | None = field(default=None)
+    auto_prepared_fast_artifacts: bool = field(default=True)
+    prepared_fast_artifacts_dir: str | None = field(default=None)
 
     @staticmethod
     def _norm_vector_dim(stats: normalize.NormStats, field_name: str) -> int:
@@ -638,6 +641,8 @@ class DM05InferenceConfig(Config):
         self.model = model
         self.is_history = is_history
         self.fast_runtime = None
+        if self.prefix_mlp_fp8_engine_dir is not None and self.backend != "fast":
+            raise ValueError("prefix_mlp_fp8_engine_dir requires backend='fast'.")
         transform_max_length = model_max_length
         if self.backend == "fast":
             if self.enable_vlm_chat:
@@ -655,12 +660,45 @@ class DM05InferenceConfig(Config):
             num_vision_images = len(self.image_prompts)
             if is_history:
                 num_vision_images += max_history_images
-            engine_path = ensure_dm05_fast_inference_engine(
-                checkpoint=model_name_or_path,
-                engine_path=self.vision_trt_engine_path,
-                num_images=num_vision_images,
-                force_rebuild=self.force_rebuild,
-            )
+            if getattr(self, "_prepared_artifacts_selected", False):
+                from opendm.infer.prefix_mlp_fp8_contract import (
+                    prefix_mlp_model_contract,
+                    prefix_source_model_sha256,
+                    validate_bundle_manifest,
+                )
+
+                try:
+                    manifest = json.loads(
+                        (
+                            pathlib.Path(self.prefix_mlp_fp8_engine_dir)
+                            / "prefix_mlp_quant_manifest.json"
+                        ).read_text()
+                    )
+                    vlm = dm05_model.model.vlm
+                    validate_bundle_manifest(
+                        manifest,
+                        prefix_mlp_model_contract(vlm.model.language_model),
+                        tuple(self.prefix_seq_len_buckets),
+                        prefix_source_sha256=prefix_source_model_sha256(vlm),
+                    )
+                except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+                    logger.warning(
+                        "Prepared FP8 artifacts do not match the loaded checkpoint; "
+                        "using the normal BF16 fast path: {}",
+                        exc,
+                    )
+                    self._prepared_artifacts_selected = False
+                    self.vision_trt_engine_path = None
+                    self.prefix_mlp_fp8_engine_dir = None
+            if getattr(self, "_prepared_artifacts_selected", False):
+                engine_path = pathlib.Path(self.vision_trt_engine_path)
+            else:
+                engine_path = ensure_dm05_fast_inference_engine(
+                    checkpoint=model_name_or_path,
+                    engine_path=self.vision_trt_engine_path,
+                    num_images=num_vision_images,
+                    force_rebuild=self.force_rebuild,
+                )
             self.vision_trt_engine_path = str(engine_path)
             model.to(self.device)
             self.fast_runtime = DM05FastInferRuntime(
@@ -672,6 +710,7 @@ class DM05InferenceConfig(Config):
                 max_history_images=max_history_images,
                 prefix_len=fast_prefix_len,
                 num_current_images=len(self.image_prompts),
+                prefix_mlp_fp8_engine_dir=self.prefix_mlp_fp8_engine_dir,
             )
             vlm_model = dm05_model.model.vlm.model
             self.fast_image_token_id = int(vlm_model.config.image_token_id)
@@ -682,12 +721,46 @@ class DM05InferenceConfig(Config):
         else:
             model.to(self.device)
 
+        self._initialize_preprocessing(
+            model_name_or_path=model_name_or_path,
+            norm_stats_path=norm_stats_path,
+            n_bins=n_bins,
+            transform_max_length=transform_max_length,
+            use_absolute_action=use_absolute_action,
+            add_state=add_state,
+            is_history=is_history,
+        )
+
+    def _initialize_preprocessing(
+        self,
+        *,
+        model_name_or_path: str | None,
+        norm_stats_path: str,
+        n_bins: int,
+        transform_max_length: int,
+        use_absolute_action: bool,
+        add_state: bool,
+        is_history: bool,
+        device: torch.device | str | None = None,
+    ) -> None:
+        """Initialize the deployment transforms without loading a model."""
+        if device is not None:
+            self.device = torch.device(device)
+        elif not hasattr(self, "device"):
+            self.device = torch.device("cpu")
+        self.use_absolute_action = use_absolute_action
+        self.last_model_latency_sec = None
+        self.is_history = is_history
+        self.default_robot_type = self._request_default("default_robot_type")
+        self.default_state_desc = self._request_default("default_state_desc")
+        self.default_speed = str(self._request_default("default_speed", "0.5"))
+        self.default_control_mode = self._request_default("default_control_mode")
         self.processor = AutoProcessor.from_pretrained(
             model_name_or_path,
             trust_remote_code=True,
         )
         self.vlm_chat_tokenization = VLMChatTokenization(self.processor)
-        logger.info("Model loaded successfully")
+        logger.info("Inference preprocessing initialized successfully")
 
         self.norm_stats_file = normalize.load_norm_stats_file(norm_stats_path)
         if self.default_robot_type is None and self.norm_stats_file.is_multi_robot:
@@ -1451,6 +1524,57 @@ class DM05Exp(Config):
                 time.sleep(5)
         assert norm_stats_path.exists()
 
+    def _inference_preprocessing_settings(self) -> tuple[pathlib.Path, dict]:
+        """Resolve the normalization file and playground request defaults."""
+        checkpoint = pathlib.Path(self.model_config.model_name_or_path)
+        checkpoint_norm = checkpoint / "norm_stats.json"
+        norm_stats_path = (
+            checkpoint_norm
+            if checkpoint_norm.exists()
+            else self.data_config.norm_stats_path(self.model_config.chunk_size)
+        )
+        dataset_info = self.data_config._dataset_info()
+        default_robot_type = dataset_info.get("robot_type")
+        if isinstance(default_robot_type, Enum):
+            default_robot_type = default_robot_type.value
+        self.inference_config.default_robot_type = default_robot_type
+        self.inference_config.default_state_desc = dataset_info.get("state_desc")
+        if dataset_info.get("speed") is not None:
+            self.inference_config.default_speed = str(dataset_info["speed"])
+        if "control_mode" in dataset_info:
+            self.inference_config.default_control_mode = dataset_info["control_mode"]
+        return norm_stats_path, dataset_info
+
+    def initialize_inference_preprocessing(self, *, device: str = "cpu") -> None:
+        """Initialize the exact playground deployment transform without a model."""
+        norm_stats_path, _ = self._inference_preprocessing_settings()
+        if not norm_stats_path.is_file():
+            raise FileNotFoundError(
+                f"Inference normalization stats do not exist: {norm_stats_path}"
+            )
+        self.inference_config._initialize_preprocessing(
+            model_name_or_path=self.model_config.model_name_or_path,
+            norm_stats_path=str(norm_stats_path),
+            n_bins=self.data_config.n_bins,
+            transform_max_length=(
+                min(
+                    self.trainer_config.model_max_length,
+                    int(
+                        getattr(self.inference_config, "fast_prefix_len", None) or 1024
+                    ),
+                )
+                if self.inference_config.backend == "fast"
+                else self.trainer_config.model_max_length
+            ),
+            use_absolute_action=(self.data_config.action_mode == ActionMode.RELATIVE),
+            add_state=self.data_config.add_state,
+            is_history=self.data_config.is_history,
+            device=device,
+        )
+        for step in self.inference_config.input_transform.transforms:
+            if isinstance(step, ChatTokenization):
+                step.reject_prompt_truncation = True
+
     def _initialize_train(self):
         self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
 
@@ -1521,31 +1645,15 @@ class DM05Exp(Config):
 
     def _initialize_inference_runtime(self) -> None:
         """Build the model and transforms shared by inference entry points."""
-        self.model_config.align_action_rope_to_language = (
-            self.inference_config.chat_only
-        )
-        use_fast_backend = (
-            self.inference_config.backend == "fast"
-            and not self.inference_config.chat_only
-        )
-        if not self.inference_config.chat_only and (
-            use_fast_backend or self.inference_config.prefix_seq_len_buckets
-        ):
-            from opendm.infer.dm05_infer import DM05FastInferRuntime
-
-            DM05FastInferRuntime.resolve_prefix_seq_len_buckets(
-                self.inference_config.prefix_seq_len_buckets,
-                fast_backend=use_fast_backend,
-                prefix_capacity=int(
-                    getattr(self.inference_config, "fast_prefix_len", None) or 1024
-                ),
-            )
+        chat_only = self.inference_config.chat_only
+        self.model_config.align_action_rope_to_language = chat_only
+        use_fast_backend = self.inference_config.backend == "fast" and not chat_only
         self.model_config.llm_attn_implementation = (
             "flex_attention" if use_fast_backend else "eager"
         )
-        logger.info(f"Loading model from {self.model_config.model_name_or_path}")
-        model = self.model_config.build_model(use_lora=self.use_lora)
-        if self.inference_config.chat_only:
+        if chat_only:
+            logger.info(f"Loading model from {self.model_config.model_name_or_path}")
+            model = self.model_config.build_model(use_lora=self.use_lora)
             self.inference_config._initialize(
                 model=model,
                 model_name_or_path=self.model_config.model_name_or_path,
@@ -1556,13 +1664,96 @@ class DM05Exp(Config):
             )
             return
 
+        norm_stats_path, _ = self._inference_preprocessing_settings()
+        if (
+            use_fast_backend
+            and self.model_config.model_name_or_path is not None
+            and self.model_config.precision_policy == BF16_MIXED_PRECISION_POLICY
+            and self.model_config.bf16
+            and not self.inference_config.force_rebuild
+            and self.inference_config.auto_prepared_fast_artifacts
+            and self.inference_config.vision_trt_engine_path is None
+            and self.inference_config.prefix_mlp_fp8_engine_dir is None
+        ):
+            from opendm.infer.fast_fp8_prepared import (
+                preprocessing_contract,
+                resolve_prepared_fast_artifacts,
+            )
+
+            num_images = len(self.inference_config.image_prompts)
+            if self.data_config.is_history:
+                num_images += int(self.inference_config.max_history_images)
+            prepared = resolve_prepared_fast_artifacts(
+                checkpoint=self.model_config.model_name_or_path,
+                prepared_dir=self.inference_config.prepared_fast_artifacts_dir,
+                num_images=num_images,
+                chunk_size=int(self.model_config.chunk_size),
+                diffusion_steps=int(self.inference_config.diffusion_steps),
+                prefix_capacity=int(
+                    getattr(self.inference_config, "fast_prefix_len", None) or 1024
+                ),
+                prefix_seq_len_buckets=self.inference_config.prefix_seq_len_buckets,
+                is_history=bool(self.data_config.is_history),
+                preprocessing=preprocessing_contract(
+                    checkpoint=self.model_config.model_name_or_path,
+                    norm_stats_path=norm_stats_path,
+                    image_prompts=self.inference_config.image_prompts,
+                    n_bins=self.data_config.n_bins,
+                    add_state=self.data_config.add_state,
+                    model_max_length=min(
+                        self.trainer_config.model_max_length,
+                        int(
+                            getattr(self.inference_config, "fast_prefix_len", None)
+                            or 1024
+                        ),
+                    ),
+                    clip_to_bounds=self.inference_config.clip_to_bounds,
+                    compose_eef_rot=self.inference_config.compose_eef_rot,
+                    default_robot_type=self.inference_config._request_default(
+                        "default_robot_type"
+                    ),
+                    default_state_desc=self.inference_config._request_default(
+                        "default_state_desc"
+                    ),
+                    default_speed=self.inference_config._request_default(
+                        "default_speed", "0.5"
+                    ),
+                    default_control_mode=self.inference_config._request_default(
+                        "default_control_mode"
+                    ),
+                ),
+                verify_build_environment=True,
+            )
+            if prepared is not None:
+                self.inference_config._prepared_artifacts_selected = True
+                self.inference_config.vision_trt_engine_path = str(
+                    prepared.vision_engine
+                )
+                self.inference_config.prefix_mlp_fp8_engine_dir = str(
+                    prepared.prefix_mlp_bundle
+                )
+                self.inference_config.prefix_seq_len_buckets = list(
+                    prepared.prefix_seq_len_buckets
+                )
+
+        if use_fast_backend or self.inference_config.prefix_seq_len_buckets:
+            from opendm.infer.dm05_infer import DM05FastInferRuntime
+
+            DM05FastInferRuntime.resolve_prefix_seq_len_buckets(
+                self.inference_config.prefix_seq_len_buckets,
+                fast_backend=use_fast_backend,
+                prefix_capacity=int(
+                    getattr(self.inference_config, "fast_prefix_len", None) or 1024
+                ),
+            )
+        if self.inference_config.prefix_mlp_fp8_engine_dir is not None:
+            # The FP8 bundle contract fingerprints standard Gemma3 MLP weights.
+            # Liger replaces those modules before runtime validation.
+            self.model_config.liger_kernel = False
+        logger.info(f"Loading model from {self.model_config.model_name_or_path}")
+        model = self.model_config.build_model(use_lora=self.use_lora)
         ckpt_norm_stats_path = (
             pathlib.Path(self.model_config.model_name_or_path) / "norm_stats.json"
-        )
-        norm_stats_path = (
-            ckpt_norm_stats_path
-            if ckpt_norm_stats_path.exists()
-            else self.data_config.norm_stats_path(self.model_config.chunk_size)
         )
         if ckpt_norm_stats_path.exists():
             logger.info(f"Using normalization stats from checkpoint: {norm_stats_path}")
@@ -1571,16 +1762,6 @@ class DM05Exp(Config):
                 "Normalization stats not found in checkpoint at "
                 f"{ckpt_norm_stats_path}; falling back to {norm_stats_path}"
             )
-        dataset_info = self.data_config._dataset_info()
-        default_robot_type = dataset_info.get("robot_type")
-        if isinstance(default_robot_type, Enum):
-            default_robot_type = default_robot_type.value
-        self.inference_config.default_robot_type = default_robot_type
-        self.inference_config.default_state_desc = dataset_info.get("state_desc")
-        if dataset_info.get("speed") is not None:
-            self.inference_config.default_speed = str(dataset_info["speed"])
-        if "control_mode" in dataset_info:
-            self.inference_config.default_control_mode = dataset_info["control_mode"]
         self.inference_config._initialize(
             model=model,
             model_name_or_path=self.model_config.model_name_or_path,
