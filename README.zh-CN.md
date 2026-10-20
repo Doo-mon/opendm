@@ -392,6 +392,12 @@ script/dm05_launcher.sh \
 - `--model-config.chunk-size 50`：指定模型一次预测的动作块（action chunk）长度。
 - `--trainer-config.num-train-steps 50000`：总训练步数。
 
+#### Multiflow
+
+对于使用 `DM05ModelConfig` 的 DM05 和 DM05-MEM 训练入口，在训练命令中追加 `--model-config.num-flow-samples 4` 即可启用 K=4 multiflow。默认值为 K=1，参数必须为正整数。
+
+每个观测的前缀只编码一次，复用于 K 组独立的噪声和时间采样，再对 flow matching loss 取平均。该参数只影响训练，推理设置保持不变。
+
 #### 启用 Weights & Biases 训练记录
 
 W&B 是可选功能，只有传入项目名称时才会启用。OpenDM 已包含 `wandb` 依赖。

@@ -77,6 +77,7 @@ class DM05Config(DMBaseConfig):
         action_dim: int = 32,
         chunk_size: int = 50,
         tie_word_embeddings: bool = True,
+        num_flow_samples: int = 1,
         **kwargs,
     ):
         if isinstance(vlm_config, dict):
@@ -88,6 +89,9 @@ class DM05Config(DMBaseConfig):
         self.action_config = action_config
         self.action_dim = action_dim
         self.chunk_size = chunk_size
+        if type(num_flow_samples) is not int or num_flow_samples < 1:
+            raise ValueError("num_flow_samples must be a positive integer")
+        self.num_flow_samples = num_flow_samples
         self.tie_word_embeddings = tie_word_embeddings
 
 
@@ -861,6 +865,15 @@ class DM05ForConditionalGeneration(DMPreTrainedModel):
         )
         prefix_len = prefix_hidden_states.shape[1]
 
+        num_flow_samples = self.config.num_flow_samples
+        if num_flow_samples > 1:
+            # Share the prefix encoding across independent flow samples.
+            batch_size *= num_flow_samples
+            input_ids = input_ids.repeat(num_flow_samples, 1)
+            action = action.repeat(num_flow_samples, 1, 1)
+            if action_mask is not None:
+                action_mask = action_mask.repeat(num_flow_samples, 1, 1)
+
         # Step 2: run suffix forward for flow matching.
         noise = torch.randn_like(action)
         time = (
@@ -909,6 +922,7 @@ class DM05ForConditionalGeneration(DMPreTrainedModel):
             position_ids=suffix_position_ids,
             past_key_values=kv_cache,
             adarms_cond=adarms_cond,
+            batch_repeats=num_flow_samples,
         )
 
         # Compute the flow-matching loss.
@@ -1722,11 +1736,19 @@ class DM05ForConditionalGeneration(DMPreTrainedModel):
         position_ids: torch.LongTensor,
         past_key_values: Cache,
         adarms_cond: torch.Tensor,
+        batch_repeats: int = 1,
     ) -> torch.Tensor:
         """Extract cache tensors and run the action expert suffix forward."""
         prefix_cache_keys, prefix_cache_values = self._extract_prefix_cache_tensors(
             past_key_values,
         )
+        if batch_repeats > 1:
+            prefix_cache_keys = tuple(
+                tensor.repeat(batch_repeats, 1, 1, 1) for tensor in prefix_cache_keys
+            )
+            prefix_cache_values = tuple(
+                tensor.repeat(batch_repeats, 1, 1, 1) for tensor in prefix_cache_values
+            )
 
         return self.model.action_expert(
             suffix_embeds=suffix_embeds,

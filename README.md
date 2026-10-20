@@ -401,6 +401,12 @@ Arguments:
 - `--model-config.chunk-size 50`: action chunk length predicted by the model.
 - `--trainer-config.num-train-steps 50000`: total number of training steps.
 
+#### Multiflow
+
+For DM05 and DM05-MEM training entries using `DM05ModelConfig`, append `--model-config.num-flow-samples 4` to the training command to enable K=4 multiflow. The default is K=1; the value must be a positive integer.
+
+Each observation prefix is encoded once and reused for K independent noise and timestep samples. Their flow-matching losses are averaged. This parameter affects training only; inference settings are unchanged.
+
 #### Enable Weights & Biases Logging
 
 W&B logging is optional and is enabled only when a project name is provided. OpenDM already includes the `wandb` dependency.

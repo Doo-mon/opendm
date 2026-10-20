@@ -76,6 +76,7 @@ class Config:
 class DM05ModelConfig(Config):
     model_name_or_path: str | None = field(default="./checkpoints/DM05")
     chunk_size: int = field(default=50)
+    num_flow_samples: int = field(default=1)
     precision_policy: Literal["bf16_mixed", "fp32_mixed"] = field(
         default=BF16_MIXED_PRECISION_POLICY
     )
@@ -98,8 +99,11 @@ class DM05ModelConfig(Config):
     lora_config: DM05LoraConfig = field(default_factory=DM05LoraConfig)
 
     def _config_overrides(self) -> dict:
+        if type(self.num_flow_samples) is not int or self.num_flow_samples < 1:
+            raise ValueError("num_flow_samples must be a positive integer")
         return {
             "chunk_size": self.chunk_size,
+            "num_flow_samples": self.num_flow_samples,
         }
 
     def _torch_dtype(self) -> torch.dtype:
